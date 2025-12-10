@@ -1,0 +1,8 @@
+# Main configuration file for Feedback-Prompt-Learning
+
+defaults:
+  - optimizer: mcts
+
+# Global settings
+seed: 42
+verbose: false
