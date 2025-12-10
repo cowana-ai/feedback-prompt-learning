@@ -17,6 +17,8 @@ from feedback_prompt_learning import cfg
 from feedback_prompt_learning.data import EvaluationResult
 from feedback_prompt_learning.search_algo.world_model import WorldModel
 
+logger = logging.getLogger(__name__)
+
 
 # Format examples using templates from config
 def format_examples(total: int, examples: list[EvaluationResult], include_feedback: bool) -> str:
@@ -412,6 +414,9 @@ class MCTSPromptOptimizerFeedback:
             avg_score=avg_score
         ).strip()
 
+        # Log which prompt template is being used (first 150 chars to verify config)
+        logger.debug(f"[MCTS Runtime] Using gradient analysis prompt template: {cfg.optimizer.gradient_analysis_prompt[:150]}...")
+
         response = await self.llm_action.ainvoke([HumanMessage(content=gradient_prompt)])
         return response.content.strip(), example_string_without_feedback
 
@@ -439,6 +444,9 @@ class MCTSPromptOptimizerFeedback:
             plural="s" if num_prompts > 1 else "",
             plural_verb="s are" if num_prompts > 1 else " is"
         ).strip()
+
+        # Log which prompt template is being used (first 150 chars to verify config)
+        logger.debug(f"[MCTS Runtime] Using prompt generation template: {cfg.optimizer.prompt_generation_prompt[:150]}...")
 
         response = await self.llm_critic.ainvoke([HumanMessage(content=optimize_prompt)])
         improved_prompts_text = response.content.strip()
