@@ -208,6 +208,172 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## Quick Start
+
+### Basic Usage
+
+Run prompt optimization on any BigBench task:
+
+```bash
+# Feedback-MCTS (multi-objective optimization)
+uv run python ./feedback_prompt_learning/utils/eval_mcts.py \
+  --method feedback \
+  --dataset geometric_shapes
+
+# PromptAgent (accuracy-only optimization)
+uv run python ./feedback_prompt_learning/utils/eval_mcts.py \
+  --method promptagent \
+  --dataset epistemic
+
+# Enable debug logging to see runtime prompt templates
+uv run python ./feedback_prompt_learning/utils/eval_mcts.py \
+  --method feedback \
+  --dataset object_counting \
+  --debug
+```
+
+### Available Datasets
+
+All datasets configured in `configs/datasets.yaml`:
+
+```bash
+--dataset geometric_shapes   # Name shapes from SVG paths
+--dataset casual_judgement   # Causal attribution reasoning
+--dataset object_counting    # Count objects in scenes
+--dataset epistemic          # Sentence entailment
+--dataset penguins          # Table reasoning
+```
+
+### Custom Dataset
+
+Add your dataset to `configs/datasets.yaml`:
+
+```yaml
+datasets:
+  my_task:
+    name: "my_task"
+    description: "Task description"
+    data_path: "dataset/my_task.json"
+    init_prompt: "Initial instruction prompt"
+    train_size: 100
+    eval_size: 50
+    test_size: 200
+    seed: 42
+    post_instruction: false
+```
+
+Then run:
+
+```bash
+uv run python ./feedback_prompt_learning/utils/eval_mcts.py \
+  --method feedback \
+  --dataset my_task
+```
+
+### Custom Reward Function with Feedback
+
+Define a reward function that returns structured feedback:
+
+```python
+from feedback_prompt_learning.data import Feedback, RewardOutput
+
+
+def my_reward_function(
+    output: str, target: str, prompt: str, raw_output: str = ""
+) -> RewardOutput:
+    """
+    Custom reward function with multi-objective feedback
+
+    Args:
+        output: Cleaned model output (after clean_response)
+        target: Expected answer
+        prompt: Current prompt being evaluated
+        raw_output: Raw model response before cleaning
+
+    Returns:
+        RewardOutput with score and structured feedback
+    """
+    # 1. Check correctness
+    is_correct = output.strip().lower() == target.strip().lower()
+    accuracy = 1.0 if is_correct else 0.0
+
+    # 2. Provide accuracy feedback
+    if is_correct:
+        accuracy_feedback = "Correct answer ✓"
+    else:
+        accuracy_feedback = f"Wrong answer: got '{output}' instead of '{target}'"
+
+    # 3. Analyze reasoning quality (optional)
+    reasoning_feedback = None
+    if not is_correct and raw_output:
+        if "step" in raw_output.lower():
+            reasoning_feedback = (
+                "Uses step-by-step reasoning but reached wrong conclusion"
+            )
+        else:
+            reasoning_feedback = "Add explicit reasoning steps to improve accuracy"
+
+    # 4. Evaluate prompt quality (optional)
+    prompt_feedback = None
+    if len(prompt) < 50:
+        prompt_feedback = "Prompt is too brief - add more context and instructions"
+    elif len(prompt) > 500:
+        prompt_feedback = "Prompt is verbose - focus on essential instructions"
+
+    # 5. Return structured feedback
+    feedback = Feedback(
+        accuracy_feedback=accuracy_feedback,
+        reasoning_feedback=reasoning_feedback,
+        prompt_feedback=prompt_feedback,
+    )
+
+    return RewardOutput(score=accuracy, feedback=feedback)
+```
+
+Then use it in your optimization:
+
+```python
+from feedback_prompt_learning.search_algo.mcts import MCTSPromptOptimizerFeedback
+from feedback_prompt_learning.search_algo.world_model import (
+    PromptOptimizationWorldModel,
+)
+from langchain_openai import ChatOpenAI
+
+# Prepare your data
+train_data = [("input1", "output1"), ("input2", "output2"), ...]
+eval_data = [("input3", "output3"), ("input4", "output4"), ...]
+
+# Initialize LLM
+llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.0)
+
+# Create world model with your reward function
+world_model = PromptOptimizationWorldModel(
+    train_dataset=train_data,
+    eval_dataset=eval_data,
+    llm=llm,
+    reward_fn=my_reward_function,
+    clean_response_fn=lambda x: x.strip(),  # Your cleaning function
+    minibatch_size_train=5,
+    minibatch_size_eval=40,
+    post_instruction=False,
+)
+
+# Run optimization
+optimizer = MCTSPromptOptimizerFeedback(
+    initial_prompt="Your initial instruction prompt",
+    world_model=world_model,
+)
+
+await optimizer.run()
+
+# Get best prompt
+output = optimizer.prepare_output()
+best_prompt = output["best_q_path"][-1].prompt
+print(f"Optimized prompt: {best_prompt}")
+```
+
+______________________________________________________________________
+
 ## Research Questions & Open Problems
 
 This framework enables empirical investigation of:
@@ -253,6 +419,42 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
+## Performance Comparison
+
+Performance across BigBench Hard tasks:
+
+| Dataset              | Baseline      | PromptAgent       | Feedback-MCTS | Best Method           | Prompt Length         |
+| -------------------- | ------------- | ----------------- | ------------- | --------------------- | --------------------- |
+| **geometric_shapes** | 0.601 ± 0.020 | 0.871 ± 0.022     | 0.869 ± 0.018 | PromptAgent (+0.270)  | 503 ± 44 / 453 ± 87   |
+| **casual_judgement** | 0.588 ± 0.037 | 0.632 ± 0.011     | 0.660 ± 0.032 | **Feedback (+0.072)** | 270 ± 145 / 428 ± 105 |
+| **object_counting**  | 0.866 ± 0.028 | **0.969 ± 0.015** | 0.955 ± 0.022 | PromptAgent (+0.103)  | 135 ± 39 / 237 ± 45   |
+| **epistemic**        | 0.840 ± 0.005 | **0.886 ± 0.025** | 0.862 ± 0.016 | PromptAgent (+0.046)  | 187 ± 111 / 399 ± 89  |
+
+*Prompt Length format: PromptAgent / Feedback-MCTS (tokens, mean ± std). Results over 5-6 runs.*
+
+**Key Findings:**
+
+- **PromptAgent wins on 3/4 tasks** despite (or because of) purely optimizing for accuracy
+- **Feedback-MCTS wins on casual_judgement** (+0.028 over PromptAgent) - a causal attribution task requiring multi-step reasoning about cause-effect relationships
+- **Prompt length**: PromptAgent produces shorter prompts (avg 273 tokens vs 379 for Feedback) but with higher variance (±85 vs ±82), suggesting less consistent prompt structure
+- Both methods substantially improve over baseline across all tasks (+7.2 to +27.0 percentage points)
+- Highest absolute performance: PromptAgent on object_counting (96.9%)
+
+**Method Characteristics:**
+
+- **PromptAgent**: Error-focused optimization, concise prompts optimized purely for accuracy
+- **Feedback-MCTS**: Multi-objective optimization (accuracy + prompt structure + reasoning quality + length constraints), produces longer but more structured prompts with explicit reasoning steps
+
+**Why Feedback-MCTS prompts are longer:**
+The Feedback-MCTS reward function balances multiple objectives beyond raw accuracy:
+
+- Prompt verbosity control (penalizes too-brief or too-verbose prompts)
+- Reasoning structure quality (encourages step-by-step thinking)
+- Output format compliance (enforces `<answer>` tags)
+  This multi-objective optimization trades some accuracy for better prompt properties, resulting in 39% longer prompts on average.
+
+______________________________________________________________________
+
 ## FAQ
 
 **Q: Is feedback-driven MCTS always better than PromptAgent?**
@@ -288,13 +490,52 @@ ______________________________________________________________________
 
 ## Contributing & Research Collaboration
 
-This is open research. We welcome:
+This is open research. We welcome contributions in several areas:
 
-- **Empirical comparisons:** Run both algorithms on your tasks and share results
-- **Reward function designs:** Share effective reward functions for different domains
-- **Algorithmic improvements:** Better sampling strategies, gradient generation prompts
-- **Theoretical analysis:** Convergence properties, sample complexity bounds
-- **New search algorithms:** Beyond MCTS (beam search, evolutionary, RL-based)
+### 1. **New Datasets & Evaluation Results**
+
+Help expand the benchmark suite:
+
+- **Add BigBench tasks**: More reasoning tasks (logical deduction, temporal reasoning, etc.)
+- **Domain-specific tasks**: Medical QA, legal reasoning, code generation, creative writing
+- **Multilingual evaluation**: Test prompt optimization across languages
+- **Share your results**: Open PRs with evaluation results on new tasks (add to Performance Comparison table)
+
+**How to contribute:**
+
+1. Add dataset config to `configs/datasets.yaml`
+2. Run both methods: `--method promptagent` and `--method feedback`
+3. Report results with mean ± std over 5+ runs
+4. Submit PR with dataset, config, and results
+
+### 2. **Reward Function Library**
+
+Share effective reward functions for different objectives:
+
+- Task-specific feedback (math reasoning, coding, creative tasks)
+- Multi-objective optimization (accuracy + brevity + style)
+- Domain constraints (medical accuracy, legal compliance)
+- Format enforcement (JSON, structured outputs)
+
+### 3. **Code Quality & Refactoring**
+
+Suggested improvements:
+
+- **Type safety**: Add comprehensive type hints throughout codebase
+- **Testing**: Unit tests for reward functions, sampling strategies, MCTS logic
+- **Modularity**: Decouple feedback generation from reward calculation
+- **Documentation**: Docstrings for all public APIs
+- **Performance**: Optimize batch evaluation, parallel tree search
+- **Configurability**: Make more hyperparameters configurable via YAML
+- **LLM backends**: Add support for Anthropic, local models, other providers
+
+### 4. **Algorithmic Research**
+
+- Better sampling strategies (uncertainty-based, diversity-driven)
+- Improved gradient generation prompts (meta-learning, few-shot examples)
+- Alternative search algorithms (beam search, evolutionary, RL-based)
+- Theoretical analysis (convergence properties, sample complexity)
+- Transfer learning (reuse optimized prompts across similar tasks)
 
 **Reproducibility Commitment:** All configurations, prompts, and experimental setups are version-controlled. We aim for full transparency in how algorithms behave.
 
