@@ -1,10 +1,14 @@
 # MCTS Optimizer Configuration
+# Use this as the default, or override with mcts_feedback.yaml or mcts_promptagent.yaml
+
+defaults:
+  - mcts_promptagent  # Options: mcts_promptagent (error-only) or mcts_feedback (feedback-based)
 
 # MCTS-specific parameters
 num_iterations: 12
 exploration_constant: 2.5
 minibatch_size_train: 5
-minibatch_size_eval: 10
+minibatch_size_eval: 40
 max_depth: 8
 expand_width: 3
 num_samples: 1
@@ -26,62 +30,10 @@ llm:
 
 sample_examples:
   num_historical: 5
-# Example formatting templates
-example_format:
-  header: "Total evaluations: {total}\nShowing {shown} evaluated examples:\n"
-  
-  with_feedback: |
-    
-    Example {index} (Score: {score:.2f}):
-    Question: {input}
-    LLM Output: {output}
-    Expected: {target}
-    Feedback: {feedback}
-  
-  without_feedback: |
-    
-    Example {index} (Score: {score:.2f}):
-    Question: {input}
-    LLM Output: {output}
-    Expected: {target}
 
-# Prompts for gradient analysis and optimization
-gradient_analysis_prompt: |
-  I'm writing prompts for a smaller language model designed for a task.
-
-  My current prompt is:
-  {prompt}
-
-  {example_string_with_feedback}
-
-  Average Score across all evaluations: {avg_score:.2f}
-
-  Your task is to perform a detailed diagnostic analysis of the current prompt focusing on the generic feedback of past predictions:
-
-  Let's first understand the problem and devise a plan to solve the problem. Carefully analyze each example and understand the errors in the response or reasoning based on the feedback and score provided. 
-  As a teacher model, analyze the errors systematically (pay attention to specific failure patterns and feedback themes), diagnose the root causes step by step. At last, based on all these reasons, summarize and list all the aspects that can improve the prompt by providing a structured response:
-  Prompt analysis (based on prompt feedback):
-  <your analysis>
-  Reasoning and diagnosis (based on error patterns and reasoning feedback):
-  <your reasoning>
-
-prompt_generation_prompt: |
-  I'm writing prompts for a language model designed for a task.
-
-  My current prompt is:
-  {current_prompt}
-
-  Here are all the examples with varying scores:
-  {example_string}
-
-  Based on the prompt errors, the problems with this prompt and the proposed solutions are:
-  {gradient}
-
-  There is a list of former prompts including the current prompt, and each prompt is modified from its former prompts:
-  {trajectory_text}
-
-  Based on the above information, please write {num_prompts} new prompt{plural} following these guidelines:
-  1. The new prompt should solve the current prompt's problems identified in the gradient analysis.
-  2. The new prompt should consider the list of prompts and evolve based on the current prompt.
-  3. Each new prompt should be wrapped with <START> and <END> tags.
-  The new prompt{plural_verb}:
+# Note: gradient_analysis_prompt and prompt_generation_prompt are now loaded from:
+# - mcts_promptagent.yaml (default): Simple error analysis for PromptAgent
+# - mcts_feedback.yaml: Detailed feedback-based analysis for MCTS with feedback
+#
+# To switch algorithms, change the defaults section above or override via command line:
+# Example: optimizer=mcts_feedback
