@@ -1,5 +1,7 @@
 # Feedback-Prompt-Learning
 
+![Feedback-Prompt-Learning Cover](cover.png)
+
 > **Own your prompts. Define what you want. Let feedback drive the system.**
 
 **Feedback-Prompt-Learning** is an open-source research framework for automatic prompt optimization using Monte Carlo Tree Search (MCTS) with feedback-driven gradient generation. This project critically examines PromptAgent's approach and proposes enhancements for more controllable, interpretable prompt optimization.
