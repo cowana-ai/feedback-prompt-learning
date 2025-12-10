@@ -6,13 +6,12 @@ Handles all data management and evaluation for MCTS prompt optimization
 import random
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
-from feedback_prompt_learning import cfg
+from feedback_prompt_learning.data import EvaluationResult, RewardOutput
 
 
 class WorldModel(ABC):
@@ -26,7 +25,7 @@ class WorldModel(ABC):
         self,
         prompt: str,
         batch_type: str = 'train'
-    ) -> tuple[float, list[dict]]:
+    ) -> tuple[float, list[EvaluationResult]]:
         """
         Evaluate a prompt on a batch of data.
 
@@ -35,7 +34,7 @@ class WorldModel(ABC):
             batch_type: 'train' or 'eval'
 
         Returns:
-            Tuple of (average_score, list_of_evaluations)
+            Tuple of (average_score, list_of_evaluation_results)
         """
         pass
 
@@ -69,9 +68,9 @@ class WorldModel(ABC):
     @abstractmethod
     def sample_examples(
         self,
-        all_evaluations: list[dict],
+        all_evaluations: list[EvaluationResult],
         num_examples: int = 5,
-    ) -> list[dict]:
+    ) -> list[EvaluationResult]:
         """
         Sample examples from evaluation history for gradient analysis.
         Different algorithms may use different strategies (e.g., errors only, stratified, random).
@@ -81,7 +80,7 @@ class WorldModel(ABC):
             num_examples: Number of examples to sample
 
         Returns:
-            List of sampled evaluation dictionaries
+            List of sampled EvaluationResult objects
         """
         pass
 
@@ -90,7 +89,7 @@ class WorldModel(ABC):
         raw_output: str,
         target: str,
         prompt: str
-    ) -> tuple[float, str]:
+    ) -> RewardOutput:
         """Calculate reward using reward function"""
         cleaned_output = self.clean_response_fn(raw_output)
 
@@ -104,7 +103,14 @@ class WorldModel(ABC):
         else:
             output = self.reward_fn(cleaned_output, target, prompt)
 
-        return output
+        # Handle both old tuple format and new RewardOutput
+        if isinstance(output, RewardOutput):
+            return output
+        elif isinstance(output, tuple):
+            # Legacy format: (score, feedback_dict)
+            return RewardOutput.from_tuple(output)
+        else:
+            raise TypeError(f"Reward function must return RewardOutput or (float, dict) tuple, got {type(output)}")
 
 class PromptOptimizationWorldModel(WorldModel):
     """
@@ -231,16 +237,9 @@ class PromptOptimizationWorldModel(WorldModel):
             raise ValueError(f"Unknown batch_type: {batch_type}")
 
     def get_fixed_eval_batch(self, depth: int) -> list[tuple[str, str]]:
-        """
-        Get a fixed evaluation batch for a given depth.
-        All nodes at same depth use same batch for fair comparison.
-        """
-        # if depth not in self.depth_eval_batches:
-        #     # First time we see this depth - get next eval batch and cache it
-        #     eval_batch = self.get_batch('eval')
-        #     self.depth_eval_batches[depth] = eval_batch
-
-        return self.eval_dataset #self.depth_eval_batches[depth]
+        """Get a fixed evaluation batch for a given depth."""
+        # TODO: Implement depth-based batch selection if needed
+        return self.eval_dataset # Always return full eval dataset
 
     def build_prompts(self, inputs: list[str], prompt: str) -> list[str]:
         """Build full prompts by combining inputs with instruction prompt"""
@@ -253,12 +252,12 @@ class PromptOptimizationWorldModel(WorldModel):
         self,
         prompt: str,
         dataset: list[tuple[str, str]]
-    ) -> tuple[float, list[dict]]:
+    ) -> tuple[float, list[EvaluationResult]]:
         """
         Evaluate a prompt on a batch of data.
 
         Returns:
-            Tuple of (average_score, list_of_detailed_evaluations)
+            Tuple of (average_score, list_of_evaluation_results)
         """
         scores = []
         evaluations = []
@@ -277,15 +276,17 @@ class PromptOptimizationWorldModel(WorldModel):
             # Calculate scores and collect feedback
             for response, (input_text, target) in zip(responses, batch):
                 raw_output = response.content
-                score, feedback = self.calculate_reward(raw_output, target, prompt)
-                scores.append(score)
-                evaluations.append({
-                    'input': input_text,
-                    'output': raw_output,
-                    'target': target,
-                    'score': score,
-                    'feedback': feedback
-                })
+                reward_output = self.calculate_reward(raw_output, target, prompt)
+                scores.append(reward_output.score)
+
+                evaluation = EvaluationResult(
+                    input=input_text,
+                    output=raw_output,
+                    target=target,
+                    score=reward_output.score,
+                    feedback=reward_output.feedback
+                )
+                evaluations.append(evaluation)
 
         avg_score = np.mean(scores) if scores else 0.0
 
@@ -295,7 +296,7 @@ class PromptOptimizationWorldModel(WorldModel):
         self,
         prompt: str,
         batch: list[tuple[str, str]]
-    ) -> list[dict]:
+    ) -> list[EvaluationResult]:
         """Evaluate prompt and return detailed feedback (without average)"""
         _, evaluations = await self.evaluate_prompt(prompt, batch)
         return evaluations
@@ -310,90 +311,18 @@ class PromptOptimizationWorldModel(WorldModel):
             'minibatch_size_train': self.minibatch_size_train,
             'minibatch_size_eval': self.minibatch_size_eval,
         }
+
     def sample_examples(
         self,
-        all_evaluations: list[dict],
+        all_evaluations: list[EvaluationResult],
         num_examples: int = 5,
-    ) -> list[dict]:
+    ) -> list[EvaluationResult]:
+        """Sample most recent examples for gradient analysis"""
         if not all_evaluations:
             return []
         batch_evals = all_evaluations[-num_examples:]
 
-        return batch_evals #[ev for ev in batch_evals if ev['score'] == 0]
-
-    # def sample_examples(
-    #     self,
-    #     all_evaluations: List[Dict],
-    #     num_examples: int = 5,
-    # ) -> List[Dict]:
-    #     """
-    #     Stratified sampling strategy: balance recent examples with historical worst.
-    #     This is specific to prompt optimization - other tasks might sample differently.
-
-    #     Args:
-    #         all_evaluations: All evaluation results
-    #         num_examples: Total number of examples to sample
-
-    #     Returns:
-    #         List of sampled examples
-    #     """
-    #     if not all_evaluations:
-    #         return []
-
-    #     # Calculate split between recent and historical
-    #     num_recent = num_examples
-    #     num_historical = cfg.optimizer.sample_examples.num_historical
-
-    #     # Separate recent batch from historical
-    #     recent_size = min(self.minibatch_size_train, len(all_evaluations))
-    #     recent_evals = all_evaluations[-recent_size:] if len(all_evaluations) >= recent_size else all_evaluations
-    #     historical_evals = all_evaluations[:-recent_size] if len(all_evaluations) > recent_size else []
-
-    #     # Get worst historical examples (sorted by score)
-    #     if historical_evals:
-    #         historical_sorted = sorted(historical_evals, key=lambda x: x['score'])
-    #         k_historical = min(10, len(historical_sorted))
-    #         historical_worst = historical_sorted[:k_historical]
-    #     else:
-    #         historical_worst = []
-
-    #     # Track selected examples by identity to prevent duplicates
-    #     selected_examples = []
-    #     selected_ids = set()
-
-    #     # Sample from recent
-    #     if recent_evals:
-    #         n_recent = min(num_recent, len(recent_evals))
-    #         sampled_recent = random.sample(recent_evals, n_recent)
-    #         for item in sampled_recent:
-    #             item_id = id(item)
-    #             if item_id not in selected_ids:
-    #                 selected_examples.append(item)
-    #                 selected_ids.add(item_id)
-
-    #     # Sample from historical worst (skip duplicates)
-    #     if historical_worst and num_historical > 0:
-    #         available_historical = [item for item in historical_worst if id(item) not in selected_ids]
-
-    #         if available_historical:
-    #             n_historical = min(num_historical, len(available_historical))
-    #             sampled_historical = random.sample(available_historical, n_historical)
-    #             for item in sampled_historical:
-    #                 selected_examples.append(item)
-    #                 selected_ids.add(id(item))
-
-    #             # Fill remaining from recent if needed
-    #             shortfall = num_historical - len(sampled_historical)
-    #             if shortfall > 0 and recent_evals:
-    #                 remaining_recent = [item for item in recent_evals if id(item) not in selected_ids]
-    #                 if remaining_recent:
-    #                     n_fill = min(shortfall, len(remaining_recent))
-    #                     fill_samples = random.sample(remaining_recent, n_fill)
-    #                     for item in fill_samples:
-    #                         selected_examples.append(item)
-    #                         selected_ids.add(id(item))
-
-    #     return selected_examples if selected_examples else all_evaluations[-num_recent:]
+        return batch_evals  # Return recent examples (could filter by score if needed)
 
 
 class PromptAgentWorldModel(PromptOptimizationWorldModel):

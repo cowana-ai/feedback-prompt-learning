@@ -3,11 +3,9 @@ MCTS Prompt Optimizer with Feedback-Driven Actions
 """
 import asyncio
 import logging
-import random
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 from hydra.utils import instantiate as hydra_instantiate
@@ -16,37 +14,46 @@ from langchain_openai import ChatOpenAI
 from tqdm import tqdm
 
 from feedback_prompt_learning import cfg
-from feedback_prompt_learning.search_algo.world_model import (
-    PromptOptimizationWorldModel, WorldModel)
+from feedback_prompt_learning.data import EvaluationResult
+from feedback_prompt_learning.search_algo.world_model import WorldModel
 
 
 # Format examples using templates from config
-def format_examples(total:int, examples: list[dict], include_feedback: bool) -> str:
+def format_examples(total: int, examples: list[EvaluationResult], include_feedback: bool) -> str:
+    """Format evaluation results for display in prompts"""
     header = cfg.optimizer.example_format.header.format(
         total=total,
         shown=len(examples)
     )
-    include_feedback = include_feedback and "feedback" in examples[0]
-    template = (cfg.optimizer.example_format.with_feedback if include_feedback
+
+    # Check if any example has feedback
+    has_any_feedback = include_feedback and any(ex.feedback is not None for ex in examples)
+    template = (cfg.optimizer.example_format.with_feedback if has_any_feedback
                 else cfg.optimizer.example_format.without_feedback)
 
     examples_text = header
-    for i, item in enumerate(examples, 1):
-        feedback = item.get('feedback', None) if include_feedback else None
+    last_prompt_feedback = None
+
+    for i, result in enumerate(examples, 1):
+        feedback = result.feedback if has_any_feedback else None
         examples_text += template.format(
             index=i,
-            score=item['score'],
-            input=item['input'],
-            output=item['output'],
-            target=item['target'],
-            accuracy_feedback=feedback["accuracy_feedback"] if feedback else None,
-            reasoning_feedback=feedback["reasoning_feedback"] if feedback else None,
+            score=result.score,
+            input=result.input,
+            output=result.output,
+            target=result.target,
+            accuracy_feedback=feedback.accuracy_feedback if feedback else None,
+            reasoning_feedback=feedback.reasoning_feedback if feedback else None,
         )
-    if feedback and feedback["prompt_feedback"]:
-        examples_text += f"\nOverall Prompt Feedback: {feedback['prompt_feedback']}\n"
-    return examples_text
+        # Track last non-None prompt feedback
+        if feedback and feedback.has_prompt_feedback():
+            last_prompt_feedback = feedback.prompt_feedback
 
-# ============================================================================
+    # Add overall prompt feedback if available
+    if last_prompt_feedback:
+        examples_text += f"\nOverall Prompt Feedback: {last_prompt_feedback}\n"
+
+    return examples_text# ============================================================================
 # DATA DEFINITIONS
 # ============================================================================
 
@@ -61,7 +68,7 @@ class MCTSNode:
     visited: int = 0
     _is_terminal: bool = False
     # Track all evaluations for better error analysis
-    all_evaluations: list[dict] = field(default_factory=list)  # Stores all (input, output, target, score, feedback)
+    all_evaluations: list[EvaluationResult] = field(default_factory=list)  # Stores evaluation results with structured feedback
 
     @property
     def N(self) -> int:
@@ -369,7 +376,7 @@ class MCTSPromptOptimizerFeedback:
     async def _get_action_decisions(
         self,
         prompt: str,
-        all_evaluations: list[dict],
+        all_evaluations: list[EvaluationResult],
     ) -> tuple[str, str]:
         """
         Ask LLM to analyze feedback and generate improvement gradient.
@@ -380,7 +387,7 @@ class MCTSPromptOptimizerFeedback:
     async def _get_descend_gradient(
         self,
         prompt: str,
-        selected_evaluations: list[dict]
+        selected_evaluations: list[EvaluationResult]
     ) -> tuple[str, str]:
         """Analyze errors to generate improvement gradient (original behavior)"""
 
@@ -393,7 +400,7 @@ class MCTSPromptOptimizerFeedback:
         )
 
         # Calculate average score across all evaluations
-        avg_score = np.mean([item['score'] for item in selected_evaluations]) if selected_evaluations else 0.0
+        avg_score = np.mean([result.score for result in selected_evaluations]) if selected_evaluations else 0.0
 
         example_string_with_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=True)
         example_string_without_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=False)
