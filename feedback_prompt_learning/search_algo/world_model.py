@@ -366,14 +366,16 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
             # Calculate scores and collect feedback
             for response, (input_text, target) in zip(responses, batch):
                 raw_output = response.content
-                score = self.calculate_reward(raw_output, target, prompt)
-                scores.append(score)
-                evaluations.append({
-                    'input': input_text,
-                    'output': raw_output,
-                    'target': target,
-                    'score': score
-                })
+                reward_output = self.calculate_reward(raw_output, target, prompt)
+                scores.append(reward_output.score)
+                evaluation = EvaluationResult(
+                    input=input_text,
+                    output=raw_output,
+                    target=target,
+                    score=reward_output.score,
+                    feedback=reward_output.feedback
+                )
+                evaluations.append(evaluation)
 
         avg_score = np.mean(scores) if scores else 0.0
 
