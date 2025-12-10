@@ -5,40 +5,47 @@ import asyncio
 import logging
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from hydra.utils import instantiate as hydra_instantiate
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from tqdm import tqdm
-from hydra.utils import instantiate as hydra_instantiate
+
 from feedback_prompt_learning import cfg
+from feedback_prompt_learning.search_algo.world_model import (
+    PromptOptimizationWorldModel, WorldModel)
 
 
 # Format examples using templates from config
-def format_examples(total:int, examples: List[Dict], include_feedback: bool) -> str:
+def format_examples(total:int, examples: list[dict], include_feedback: bool) -> str:
     header = cfg.optimizer.example_format.header.format(
         total=total,
         shown=len(examples)
     )
-    
-    template = (cfg.optimizer.example_format.with_feedback if include_feedback 
+    include_feedback = include_feedback and "feedback" in examples[0]
+    template = (cfg.optimizer.example_format.with_feedback if include_feedback
                 else cfg.optimizer.example_format.without_feedback)
-    
+
     examples_text = header
     for i, item in enumerate(examples, 1):
+        feedback = item.get('feedback', None) if include_feedback else None
         examples_text += template.format(
             index=i,
             score=item['score'],
             input=item['input'],
             output=item['output'],
             target=item['target'],
-            feedback=item.get('feedback', '')
+            accuracy_feedback=feedback["accuracy_feedback"] if feedback else None,
+            reasoning_feedback=feedback["reasoning_feedback"] if feedback else None,
         )
-    
+    if feedback and feedback["prompt_feedback"]:
+        examples_text += f"\nOverall Prompt Feedback: {feedback['prompt_feedback']}\n"
     return examples_text
-        
+
 # ============================================================================
 # DATA DEFINITIONS
 # ============================================================================
@@ -48,24 +55,24 @@ class MCTSNode:
     """Node in MCTS tree for prompt optimization"""
     prompt: str
     parent: Optional['MCTSNode'] = None
-    children: List['MCTSNode'] = field(default_factory=list)
-    cum_rewards: List[float] = field(default_factory=list)
+    children: list['MCTSNode'] = field(default_factory=list)
+    cum_rewards: list[float] = field(default_factory=list)
     reward: float = 0.0
     visited: int = 0
     _is_terminal: bool = False
     # Track all evaluations for better error analysis
-    all_evaluations: List[Dict] = field(default_factory=list)  # Stores all (input, output, target, score, feedback)
-    
+    all_evaluations: list[dict] = field(default_factory=list)  # Stores all (input, output, target, score, feedback)
+
     @property
     def N(self) -> int:
         """Visit count"""
         return self.visited
-    
+
     @property
     def Q(self) -> float:
         """Average cumulative reward (Q-value for UCT)"""
         return np.mean(self.cum_rewards) if self.cum_rewards else 0.0
-    
+
     @property
     def depth(self) -> int:
         """Depth in tree"""
@@ -75,7 +82,7 @@ class MCTSNode:
             d += 1
             current = current.parent
         return d
-    
+
     def is_terminal(self, max_depth: int) -> bool:
         """Check if node is terminal"""
         return self.depth >= max_depth or self._is_terminal
@@ -87,227 +94,131 @@ class MCTSNode:
 
 class MCTSPromptOptimizerFeedback:
     """MCTS for Prompt Optimization using LLM-generated actions based on feedback"""
-    
+
     def __init__(
         self,
         initial_prompt: str,
-        train_dataset: List[Tuple[str, str]],
-        reward_fn: Callable[[str, str, str], Tuple[float, str]],
-        llm: ChatOpenAI = hydra_instantiate(cfg.optimizer.llm.student),
+        world_model: WorldModel,
         llm_action: ChatOpenAI = hydra_instantiate(cfg.optimizer.llm.action),
         llm_critic: ChatOpenAI = hydra_instantiate(cfg.optimizer.llm.critic),
         num_iterations: int = cfg.optimizer.num_iterations,
         exploration_constant: float = cfg.optimizer.exploration_constant,
-        minibatch_size_train: int = cfg.optimizer.minibatch_size_train,
-        minibatch_size_eval: int = cfg.optimizer.minibatch_size_eval,
         max_depth: int = cfg.optimizer.max_depth,
         expand_width: int = cfg.optimizer.expand_width,  # Number of gradient analyses per expansion
         num_samples: int = cfg.optimizer.num_samples,   # Number of prompts generated per gradient
-        post_instruction: bool = True,  # If True: question + prompt, else: prompt + question
-        clean_response_fn: Optional[Callable[[str], str]] = None,  # Function to clean LLM responses
         log_freq: int = 2,
-        eval_dataset: Optional[List[Tuple[str, str]]] = None  # Optional eval dataset
     ):
+
         self.initial_prompt = initial_prompt
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset if eval_dataset is not None else []
-        self.llm = llm
+        self.world_model = world_model
         self.llm_action = llm_action
         self.llm_critic = llm_critic
-        self.reward_fn = reward_fn
         self.num_iterations = num_iterations
         self.c = exploration_constant
-        self.minibatch_size_train = minibatch_size_train
-        self.minibatch_size_eval = minibatch_size_eval
         self.max_depth = max_depth
         self.expand_width = expand_width
         self.num_samples = num_samples
-        self.post_instruction = post_instruction
-        self.clean_response_fn = clean_response_fn if clean_response_fn else lambda x: x.strip()
         self.log_freq = log_freq
         self.root = MCTSNode(prompt=initial_prompt)
-        
-        # Threshold tracking for early stopping (like original MCTS)
-        self.mcts_threshold = 0.0  # The highest reward node globally
-        self.min_threshold = 0.0   # The root node's reward as a min threshold
-        self.min_depth = 2  # Apply early stop only when depth is larger than min_depth
-        
-        # Track all nodes and iteration paths (like original MCTS)
-        self.all_nodes = [self.root]  # All nodes created
-        self.trace_in_each_iter = []  # Path taken in each iteration
-        
-        # DataLoader-style batching for training dataset
-        self.train_dataset_copy = list(train_dataset)
-        self.current_batch_idx = 0
-        self._create_batches('train')
-        
-        # DataLoader-style batching for eval dataset
-        self.eval_dataset_copy = list(self.eval_dataset)
-        self.current_eval_batch_idx = 0
-        self._create_batches('eval')
-        
-        # Cache eval batches by depth for fair comparison
-        # All nodes at same depth use same eval batch
-        self.depth_eval_batches: Dict[int, List[Tuple[str, str]]] = {}
-        
+
+        # Threshold tracking for early stopping
+        self.mcts_threshold = 0.0
+        self.min_threshold = 0.0
+        self.min_depth = 2
+
+        # Track all nodes and iteration paths
+        self.all_nodes = [self.root]
+        self.trace_in_each_iter = []
+
         # Initialize logger
         self.logger = logging.getLogger(__name__)
-        
+
+        # Log dataset info
+        dataset_info = world_model.get_dataset_info()
         self.logger.info(f"Feedback-driven MCTS initialized")
-        self.logger.info(f"Train Dataset: {len(train_dataset)} examples, {self.num_batches} batches of ~{minibatch_size_train}")
-        if self.eval_dataset:
-            self.logger.info(f"Eval Dataset: {len(self.eval_dataset)} examples, {self.num_eval_batches} batches of ~{minibatch_size_eval}")
-    
-    def _create_batches(self, dataset_type: str = 'train'):
-        """Create batches from dataset
-        
-        Args:
-            dataset_type: 'train' or 'eval'
-        """
-        if dataset_type == 'train':
-            dataset_copy = self.train_dataset_copy
-            random.shuffle(dataset_copy)
-            dataset_len = len(dataset_copy)
-            num_batches = max(1, dataset_len // self.minibatch_size_train)
-            batches = []
-            
-            for i in range(num_batches):
-                start_idx = i * self.minibatch_size_train
-                end_idx = min(start_idx + self.minibatch_size_train, dataset_len)
-                batches.append(dataset_copy[start_idx:end_idx])
-            
-            self.num_batches = num_batches
-            self.batches = batches
-        
-        elif dataset_type == 'eval':
-            if not self.eval_dataset_copy:
-                self.num_eval_batches = 0
-                self.eval_batches = []
-                return
-            
-            dataset_copy = self.eval_dataset_copy
-            random.shuffle(dataset_copy)
-            dataset_len = len(dataset_copy)
-            num_batches = max(1, dataset_len // self.minibatch_size_eval)
-            batches = []
-            
-            for i in range(num_batches):
-                start_idx = i * self.minibatch_size_eval
-                end_idx = min(start_idx + self.minibatch_size_eval, dataset_len)
-                batches.append(dataset_copy[start_idx:end_idx])
-            
-            self.num_eval_batches = num_batches
-            self.eval_batches = batches
-        
-    
-    def _get_next_batch_train(self) -> List[Tuple[str, str]]:
-        """Get next batch"""
-        if not self.batches:
-            return []
-        
-        batch = self.batches[self.current_batch_idx]
-        self.current_batch_idx = (self.current_batch_idx + 1) % self.num_batches
-        
-        if self.current_batch_idx == 0:
-            random.shuffle(self.train_dataset_copy)
-            self._create_batches('train')
-        
-        return batch
-    
-    def _get_next_batch_eval(self) -> List[Tuple[str, str]]:
-        """Get next batch from eval dataset"""
-        if not self.eval_batches:
-            return []
-        
-        batch = self.eval_batches[self.current_eval_batch_idx]
-        self.current_eval_batch_idx = (self.current_eval_batch_idx + 1) % self.num_eval_batches
-        
-        if self.current_eval_batch_idx == 0:
-            random.shuffle(self.eval_dataset_copy)
-            self._create_batches('eval')
-        
-        return batch
-    
+        self.logger.info(f"Train Dataset: {dataset_info['train_size']} examples, {dataset_info['train_batches']} batches of ~{dataset_info['minibatch_size_train']}")
+        if dataset_info['eval_size'] > 0:
+            self.logger.info(f"Eval Dataset: {dataset_info['eval_size']} examples, {dataset_info['eval_batches']} batches of ~{dataset_info['minibatch_size_eval']}")
+
     async def run(self) -> MCTSNode:
         """Main MCTS algorithm"""
         self.logger.info(f"\nStarting MCTS with {self.num_iterations} iterations...")
         self.logger.info(f"Initial prompt: {self.initial_prompt}\n")
-        
-        # Initialize root - evaluate on eval batch for unbiased reward
 
+        # Initialize root - evaluate on eval batch for unbiased reward
         # Root is at depth 0, get eval batch for it
-        eval_batch = self._get_eval_batch_for_depth(0)
-        self.root.reward, eval_evaluations = await self._evaluate_prompt(self.root.prompt, eval_batch)
-        
+        eval_batch = self.world_model.get_fixed_eval_batch(0)
+        self.root.reward, eval_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, eval_batch)
+
         # Also get train batch for gradient analysis
-        train_batch = self._get_next_batch_train()
-        _, train_evaluations = await self._evaluate_prompt(self.root.prompt, train_batch)
+        train_batch = self.world_model.get_batch('train')
+        _, train_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, train_batch)
         self.root.all_evaluations.extend(train_evaluations)
 
-        
+
         self.logger.info(f"Root initial reward: {self.root.reward:.4f}\n")
-        
+
         # Initialize thresholds
         if self.min_threshold == 0:
             self.min_threshold = self.root.reward
             self.mcts_threshold = self.root.reward
-        
+
         for iteration in tqdm(range(self.num_iterations), desc="MCTS Iterations", ncols=100, file=None, mininterval=0.1):
             # Selection
             path = self._select(self.root)
-            
+
             # Expansion (fetches batches internally)
             if not path[-1].is_terminal(self.max_depth):
                 await self._expand(path[-1])
-                
+
                 # Simulation (fetches batches internally)
                 await self._simulate(path)
-            
+
             # Backpropagation
             self._backpropagation(path)
-            
+
             # Track path for this iteration
             self.trace_in_each_iter.append(path.copy())
-            
+
             # Logging
             if (iteration + 1) % self.log_freq == 0:
                 best = self._best_child_of(self.root)
                 tqdm.write(f"Iter {iteration + 1} | Best Q: {best.Q:.4f} | Root Q: {self.root.Q:.4f}")
-        
+
         self.logger.info("\n" + "="*80)
         self.logger.info("MCTS COMPLETE")
         self.logger.info("="*80)
-        
+
         return self._best_child_of(self.root)
-    
+
     def _uct(self, node: MCTSNode) -> float:
         """Calculate UCT value"""
         N_parent = node.parent.N if node.parent else 0
         return node.Q + self.c * np.sqrt(np.log(N_parent + 1) / max(1, node.N))
-    
-    def _select(self, node: MCTSNode) -> List[MCTSNode]:
+
+    def _select(self, node: MCTSNode) -> list[MCTSNode]:
         """Selection phase"""
         path = []
         while True:
             path.append(node)
             node.visited += 1
-            
+
             if len(node.children) == 0 or node.is_terminal(self.max_depth):
                 return path
-            
+
             node = max(node.children, key=self._uct)
-        
+
         return path
-    
+
     def increase_threshold(self, threshold: float):
         """Update the global max threshold if a better reward is found"""
         if threshold > self.mcts_threshold:
             self.mcts_threshold = threshold
-    
+
     def early_stop(self, node: MCTSNode) -> bool:
         """Check if node is good enough to stop simulation early"""
         return node.reward > self.mcts_threshold and node.depth > self.min_depth
-    
+
     def _is_terminal_with_min_threshold(self, node: MCTSNode) -> bool:
         """Check if node reward is too low to continue exploring"""
         if node.parent is None:
@@ -315,8 +226,8 @@ class MCTSPromptOptimizerFeedback:
         else:
             min_threshold = (self.min_threshold + node.parent.reward) / 2
         return node.reward < min_threshold and node.depth > self.min_depth
-    
-    def _get_trajectory_prompts(self, node: MCTSNode) -> List[str]:
+
+    def _get_trajectory_prompts(self, node: MCTSNode) -> list[str]:
         """Collect the trajectory of prompts from root to given node"""
         trajectory_prompts = []
         temp_node = node
@@ -324,44 +235,27 @@ class MCTSPromptOptimizerFeedback:
             trajectory_prompts.append(temp_node.prompt)
             temp_node = temp_node.parent
         return trajectory_prompts[::-1]  # Reverse to get root -> node order
-    
-    def _get_eval_batch_for_depth(self, depth: int) -> List[Tuple[str, str]]:
-        """
-        Get a fixed eval batch for a given depth.
-        All nodes at the same depth use the same eval batch for fair comparison.
-        
-        Args:
-            depth: Node depth in the tree
-            
-        Returns:
-            Fixed eval batch for this depth
-        """
-        if depth not in self.depth_eval_batches:
-            # First time we see this depth - get next eval batch and cache it
-            eval_batch = self._get_next_batch_eval()
-            self.depth_eval_batches[depth] = eval_batch
-        
-        return self.depth_eval_batches[depth]
-    
+
+
     async def _generate_gradient_and_prompts(
         self,
         node: MCTSNode,
-        minibatch: List[Tuple[str, str]],
-        trajectory_prompts: List[str]
-    ) -> List[str]:
+        minibatch: list[tuple[str, str]],
+        trajectory_prompts: list[str]
+    ) -> list[str]:
         """Generate gradient analysis and new prompts for one expansion width"""
         # Evaluate current prompt and collect feedback
-        batch_feedback = await self._evaluate_prompt_with_feedback(node.prompt, minibatch)
-        
+        batch_feedback = await self.world_model.evaluate_prompt_with_feedback(node.prompt, minibatch)
+
         # Store evaluations in parent node for tracking
         node.all_evaluations.extend(batch_feedback)
-        
+
         # Ask LLM to analyze errors and generate gradient (improvement direction)
         gradient, sampled_example_string = await self._get_action_decisions(
-            node.prompt, batch_feedback, node.all_evaluations
+            node.prompt, node.all_evaluations
         )
         assert len(sampled_example_string) > 0, "Example string should not be empty"
-        
+
         # Generate num_samples prompts from this gradient
         new_prompts = await self._generate_new_prompts(
             node.prompt,
@@ -370,46 +264,46 @@ class MCTSPromptOptimizerFeedback:
             self.num_samples,
             sampled_example_string
         )
-        
+
         return new_prompts
-    
-    async def _expand(self, node: MCTSNode) -> List[MCTSNode]:
+
+    async def _expand(self, node: MCTSNode) -> list[MCTSNode]:
         """Expansion phase - generate new prompts using LLM with trajectory context"""
         if node.is_terminal(self.max_depth):
             return []
-        
+
         expand_start = time.time()
-        
+
         # Get trajectory from root to current node
         trajectory_prompts = self._get_trajectory_prompts(node)
-        
+
         # OPTIMIZATION 1: Parallelize gradient generation across expand_width
         # Each width generates num_samples prompts
         gradient_tasks = []
         minibatches = []  # Store minibatches for later use
         for width_idx in range(self.expand_width):
-            minibatch = self._get_next_batch_train()
+            minibatch = self.world_model.get_batch('train')
             minibatches.append(minibatch)
             task = self._generate_gradient_and_prompts(node, minibatch, trajectory_prompts)
             gradient_tasks.append(task)
-        
+
         # Wait for all gradient analyses to complete in parallel
         all_new_prompts_by_width = await asyncio.gather(*gradient_tasks)
-        
+
         # Flatten the list of lists into a single list of all new prompts
         all_new_prompts = []
         for prompts in all_new_prompts_by_width:
             all_new_prompts.extend(prompts)
-        
+
         # OPTIMIZATION 2: Parallelize all child evaluations on eval batch
         # Only evaluate on eval dataset for reward signal (no redundant train evals)
         child_depth = node.depth + 1
-        eval_batch = self._get_eval_batch_for_depth(child_depth)
-        
+        eval_batch = self.world_model.get_fixed_eval_batch(child_depth)
+
         # Evaluate all new prompts in parallel
-        eval_tasks = [self._evaluate_prompt(prompt, eval_batch) for prompt in all_new_prompts]
+        eval_tasks = [self.world_model.evaluate_prompt(prompt, eval_batch) for prompt in all_new_prompts]
         eval_results = await asyncio.gather(*eval_tasks)
-        
+
         # Create child nodes with eval results
         all_children = []
         for new_prompt, (reward, eval_evaluations) in zip(all_new_prompts, eval_results):
@@ -422,259 +316,88 @@ class MCTSPromptOptimizerFeedback:
             # Train evaluations will be collected when this node is expanded
             all_children.append(child)
             self.all_nodes.append(child)
-        
+
         node.children.extend(all_children)
-        
+
         expand_time = time.time() - expand_start
         self.logger.debug(f"Expansion took {expand_time:.2f}s for {len(all_children)} children")
-        
+
         return all_children
-    
-    async def _simulate(self, path: List[MCTSNode]):
+
+    async def _simulate(self, path: list[MCTSNode]):
         """Simulation phase with early stopping"""
         node = path[-1]
-        
+
         while True:
             # Early stop if we found a very good node
             if self.early_stop(node):
                 node._is_terminal = True
                 self.increase_threshold(node.reward)
                 break
-            
+
             # Update global threshold
             self.increase_threshold(node.reward)
-            
+
             # Check if terminal (depth limit or low reward)
             if node.is_terminal(self.max_depth) or self._is_terminal_with_min_threshold(node):
                 break
-            
+
             # Expand if no children
             if len(node.children) == 0:
                 await self._expand(node)  # _expand fetches batch internally
-            
+
             # Break if still no children after expansion
             if len(node.children) == 0:
                 node._is_terminal = True
                 break
-            
+
             # Greedy selection - choose best child by reward
             node = max(node.children, key=lambda c: c.reward)
             node.visited += 1
             path.append(node)
-    
-    def _backpropagation(self, path: List[MCTSNode]):
+
+    def _backpropagation(self, path: list[MCTSNode]):
         """Backpropagation phase"""
         rewards = []
         for node in reversed(path):
             rewards.append(node.reward)
             cum_reward = np.sum(rewards[::-1])
             node.cum_rewards.append(cum_reward)
-    
-    def build_forward_prompts(self, questions: List[str], cur_prompt: str) -> List[str]:
-        """
-        Build full prompts by combining questions and prompt.
-        Format depends on post_instruction parameter.
-        """
-        prompts = []
-        if self.post_instruction:
-            for question in questions:
-                prompts.append(f'{question}\n{cur_prompt}')
-        else:
-            for question in questions:
-                prompts.append(f'{cur_prompt}\n{question}')
-        return prompts
-    
-    def calculate_reward(self, raw_output: str, target: str, prompt: str) -> Tuple[float, str]:
-        """
-        Calculate reward by cleaning response and calling reward function.
-        
-        Args:
-            raw_output: Raw LLM response content
-            target: Expected target output
-            prompt: The prompt used
-            
-        Returns:
-            Tuple of (score, feedback)
-        """
-        cleaned_output = self.clean_response_fn(raw_output)
-        
-        # Check if reward function accepts raw_output parameter
-        import inspect
-        sig = inspect.signature(self.reward_fn)
-        if 'raw_output' in sig.parameters:
-            score, feedback = self.reward_fn(cleaned_output, target, prompt, raw_output=raw_output)
-        else:
-            score, feedback = self.reward_fn(cleaned_output, target, prompt)
-        
-        return score, feedback
-    
-    async def _evaluate_prompt(self, prompt: str, minibatch: List[Tuple[str, str]]) -> Tuple[float, List[Dict]]:
-        """Evaluate prompt and return average score plus detailed evaluations"""
-        questions = [input_text for input_text, _ in minibatch]
-        full_prompts = self.build_forward_prompts(questions, prompt)
-        messages_batch = [[HumanMessage(content=p)] for p in full_prompts]
-        
-        responses = await self.llm.abatch(messages_batch)
-        
-        scores = []
-        evaluations = []
-        for response, (input_text, target) in zip(responses, minibatch):
-            raw_output = response.content
-            score, feedback = self.calculate_reward(raw_output, target, prompt)
-            scores.append(score)
-            evaluations.append({
-                'input': input_text,
-                'output': raw_output,  # Store raw output for better LLM analysis
-                'target': target,
-                'score': score,
-                'feedback': feedback
-            })
-        
-        avg_score = np.mean(scores) if scores else 0.0
-        
-        return avg_score, evaluations
-    
-    async def _evaluate_prompt_with_feedback(
-        self, 
-        prompt: str, 
-        minibatch: List[Tuple[str, str]]
-    ) -> List[Dict]:
-        """Evaluate prompt and collect detailed feedback"""
-        questions = [input_text for input_text, _ in minibatch]
-        full_prompts = self.build_forward_prompts(questions, prompt)
-        messages_batch = [[HumanMessage(content=p)] for p in full_prompts]
-        
-        responses = await self.llm.abatch(messages_batch)
-        
-        feedback_items = []
-        for response, (input_text, target) in zip(responses, minibatch):
-            raw_output = response.content
-            score, feedback = self.calculate_reward(raw_output, target, prompt)
-            
-            feedback_items.append({
-                'input': input_text,
-                'output': raw_output,  # Store raw output for better LLM analysis
-                'target': target,
-                'score': score,
-                'feedback': feedback
-            })
-        
-        return feedback_items
-    
-    def _sample_examples(
-        self,
-        selected_evaluations: List[Dict],
-        num_recent: int = 3,
-        num_historical: int = 2,
-    ) -> List[Dict]:
-        """
-        Stratified sampling: balance recent examples with historical ones.
-        Prevents both recency bias and stale historical bias.
-        Guarantees no duplicate examples by tracking object identity.
-        
-        Args:
-            selected_evaluations: All evaluation results
-            num_recent: Number of examples to sample from recent batch
-            num_historical: Number of examples to sample from historical data
-            fallback_total: Total number of examples if stratified sampling fails
-            
-        Returns:
-            List of sampled examples (no duplicates)
-        """
-        # Filter evaluations based on criteria
-        filtered_evals = selected_evaluations
-        
-        if not filtered_evals:
-            return []
-        
-        # Separate recent batch (last minibatch_size examples) from historical
-        recent_size = min(self.minibatch_size_train, len(filtered_evals))
-        recent_evals = filtered_evals[-recent_size:] if len(filtered_evals) >= recent_size else filtered_evals
-        historical_evals = filtered_evals[:-recent_size] if len(filtered_evals) > recent_size else []
-        
-        # Get worst historical examples (sorted by score)
-        if historical_evals:
-            historical_sorted = sorted(historical_evals, key=lambda x: x['score'])
-            k_historical = min(10, len(historical_sorted))
-            historical_worst = historical_sorted[:k_historical]
-        else:
-            historical_worst = []
-        
-        # Track selected examples by identity to prevent duplicates
-        selected_examples = []
-        selected_ids = set()
-        
-        # Sample from recent
-        if recent_evals:
-            n_recent = min(num_recent, len(recent_evals))
-            sampled_recent = random.sample(recent_evals, n_recent)
-            for item in sampled_recent:
-                item_id = id(item)
-                if item_id not in selected_ids:
-                    selected_examples.append(item)
-                    selected_ids.add(item_id)
-        
-        # Sample from historical worst (skip duplicates)
-        if historical_worst:
-            # Filter out items already selected from recent
-            available_historical = [item for item in historical_worst if id(item) not in selected_ids]
-            
-            if available_historical:
-                n_historical = min(num_historical, len(available_historical))
-                sampled_historical = random.sample(available_historical, n_historical)
-                for item in sampled_historical:
-                    selected_examples.append(item)
-                    selected_ids.add(id(item))
-                
-                # If we couldn't get enough from historical, fill from remaining recent
-                shortfall = num_historical - len(sampled_historical)
-                if shortfall > 0 and recent_evals:
-                    remaining_recent = [item for item in recent_evals if id(item) not in selected_ids]
-                    if remaining_recent:
-                        n_fill = min(shortfall, len(remaining_recent))
-                        fill_samples = random.sample(remaining_recent, n_fill)
-                        for item in fill_samples:
-                            selected_examples.append(item)
-                            selected_ids.add(id(item))
-        
-        # Fallback: if stratified sampling didn't get enough examples
-        if not selected_examples:
-            raise ValueError("No examples selected in stratified sampling.")
-        
-        return selected_examples
-    
+
+
+
     async def _get_action_decisions(
-        self, 
-        prompt: str, 
-        batch_feedback: List[Dict],
-        all_evaluations: List[Dict],
-    ) -> Tuple[str, str]:
+        self,
+        prompt: str,
+        all_evaluations: list[dict],
+    ) -> tuple[str, str]:
         """
         Ask LLM to analyze feedback and generate improvement gradient.
         """
         # TODO: consider adding gradient ascend analysis when average score is high
         return await self._get_descend_gradient(prompt, all_evaluations)
-    
+
     async def _get_descend_gradient(
         self,
         prompt: str,
-        selected_evaluations: List[Dict]
-    ) -> Tuple[str, str]:
+        selected_evaluations: list[dict]
+    ) -> tuple[str, str]:
         """Analyze errors to generate improvement gradient (original behavior)"""
-        
-        # Use stratified sampling to get worst examples (errors only)
-        sampled_examples = self._sample_examples(
-            selected_evaluations=selected_evaluations,
-            num_recent=self.minibatch_size_train,
-            num_historical=cfg.optimizer.sample_examples.num_historical,
+
+        # Use WorldModel's sampling strategy (delegates to specific implementation)
+        dataset_info = self.world_model.get_dataset_info()
+        num_examples = dataset_info['minibatch_size_train']
+        sampled_examples = self.world_model.sample_examples(
+            all_evaluations=selected_evaluations,
+            num_examples=num_examples,
         )
-        
+
         # Calculate average score across all evaluations
         avg_score = np.mean([item['score'] for item in selected_evaluations]) if selected_evaluations else 0.0
-        
+
         example_string_with_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=True)
         example_string_without_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=False)
-        
+
         # Gradient analysis prompt (descend - focus on errors)
         gradient_prompt = cfg.optimizer.gradient_analysis_prompt.format(
             prompt=prompt,
@@ -684,22 +407,22 @@ class MCTSPromptOptimizerFeedback:
 
         response = await self.llm_action.ainvoke([HumanMessage(content=gradient_prompt)])
         return response.content.strip(), example_string_without_feedback
-    
+
     async def _generate_new_prompts(
         self,
         current_prompt: str,
         gradient: str,
-        trajectory_prompts: List[str],
+        trajectory_prompts: list[str],
         num_prompts: int,
         example_string: str = ""
-    ) -> List[str]:
+    ) -> list[str]:
         """Generate new prompt based on gradient analysis and trajectory"""
-        
+
         # Format trajectory for context
         trajectory_text = ""
         for i, traj_prompt in enumerate(trajectory_prompts):
             trajectory_text += f"\n{i+1}. {traj_prompt}\n"
-        
+
         optimize_prompt = cfg.optimizer.prompt_generation_prompt.format(
             current_prompt=current_prompt,
             example_string=example_string,
@@ -712,34 +435,34 @@ class MCTSPromptOptimizerFeedback:
 
         response = await self.llm_critic.ainvoke([HumanMessage(content=optimize_prompt)])
         improved_prompts_text = response.content.strip()
-        
+
         # Extract all prompts between <START> and <END> tags
         import re
         matches = re.findall(r'<START>\s*(.+?)\s*<END>', improved_prompts_text, re.DOTALL)
-        
+
         if matches:
             improved_prompts = [match.strip() for match in matches[:num_prompts]]
         else:
             # Fallback: if no tags found, return current prompt
             improved_prompts = [current_prompt]
-        
+
         # Ensure we return exactly num_prompts (pad with current if needed)
         while len(improved_prompts) < num_prompts:
             improved_prompts.append(current_prompt)
-        
+
         return improved_prompts[:num_prompts]
-    
+
     def _best_child_of(self, node: MCTSNode) -> MCTSNode:
         """Return best child by Q value"""
         if not node.children:
             return node
         return max(node.children, key=lambda c: c.Q)
-    
-    def get_best_prompt(self) -> Tuple[MCTSNode, str]:
+
+    def get_best_prompt(self) -> tuple[MCTSNode, str]:
         """Get the best prompt found"""
         best_node = self.root
         best_q = self.root.Q
-        
+
         def search_tree(node: MCTSNode):
             nonlocal best_node, best_q
             if node.N > 0 and node.Q > best_q:
@@ -747,59 +470,59 @@ class MCTSPromptOptimizerFeedback:
                 best_node = node
             for child in node.children:
                 search_tree(child)
-        
+
         search_tree(self.root)
-        
+
         return best_node, best_node.prompt
-    
-    def get_best_path_with_rewards(self) -> Tuple[List[MCTSNode], List[float]]:
+
+    def get_best_path_with_rewards(self) -> tuple[list[MCTSNode], list[float]]:
         """
         Get the best path from root to a leaf by following highest Q-value children
-        
+
         Returns:
             Tuple of (path, rewards) where path is list of nodes and rewards is their Q-values
         """
         path = []
         rewards = []
         current = self.root
-        
+
         while current is not None:
             path.append(current)
             rewards.append(current.Q)
-            
+
             if len(current.children) == 0:
                 break
-            
+
             # Follow child with highest Q-value
             current = max(current.children, key=lambda c: c.Q)
-        
+
         return path, rewards
-    
-    def get_best_prompt_in_best_path(self) -> Tuple[MCTSNode, List[MCTSNode]]:
+
+    def get_best_prompt_in_best_path(self) -> tuple[MCTSNode, list[MCTSNode]]:
         """
         Find the node with highest Q-value along the best path (greedy path following highest Q children)
-        
+
         Returns:
             Tuple of (best_node, path) where best_node has highest Q in the path
         """
         path, rewards = self.get_best_path_with_rewards()
-        
+
         if not path:
             return self.root, [self.root]
-        
+
         # Find node with maximum Q-value in the path
         best_idx = np.argmax(rewards)
         best_node = path[best_idx]
-        
+
         return best_node, path
-    
-    def get_best_prompts_comprehensive(self) -> Dict:
+
+    def get_best_prompts_comprehensive(self) -> dict:
         """
         Get best prompts using multiple strategies for comparison
         Returns dictionary with different selection strategies
         """
         results = {}
-        
+
         # Strategy 1: Best child of root (most immediate improvement)
         best_child = self._best_child_of(self.root)
         results['best_child_of_root'] = {
@@ -811,7 +534,7 @@ class MCTSPromptOptimizerFeedback:
             'depth': 1,
             'strategy': 'Highest Q-value among root\'s children (immediate improvement)'
         }
-        
+
         # Strategy 2: Best path (greedy traversal)
         best_path_nodes, best_path_rewards = self.get_best_path_with_rewards()
         best_path_terminal = best_path_nodes[-1]
@@ -826,7 +549,7 @@ class MCTSPromptOptimizerFeedback:
             'path_rewards': best_path_rewards,
             'strategy': 'Terminal node of best path (greedy Q-value traversal)'
         }
-        
+
         # Strategy 3: Best node in best path (highest Q in path)
         best_in_path, full_path = self.get_best_prompt_in_best_path()
         best_in_path_path = []
@@ -835,7 +558,7 @@ class MCTSPromptOptimizerFeedback:
             best_in_path_path.append(current)
             current = current.parent
         best_in_path_path.reverse()
-        
+
         results['best_in_best_path'] = {
             'node': best_in_path,
             'prompt': best_in_path.prompt,
@@ -847,54 +570,54 @@ class MCTSPromptOptimizerFeedback:
             'full_search_path': full_path,
             'strategy': 'Best node in best path by Q-value (recommended)'
         }
-        
+
         return results
-    
-    def prepare_output(self) -> Dict:
+
+    def prepare_output(self) -> dict:
         """Prepare comprehensive output matching original MCTS format"""
         self.logger.info("\n" + "="*80)
         self.logger.info("PREPARING OUTPUT - ANALYZING ALL PATHS")
         self.logger.info("="*80)
-        
+
         paths_nodes = []
         paths_qs = []
         paths_rewards = []
         paths_ucts = []
-        
+
         # Analyze each iteration path
         for i, path in enumerate(self.trace_in_each_iter):
             path_qs = []
             path_rewards = []
             path_ucts = []
-            
+
             for node in path:
                 uct = self._uct(node)
                 path_ucts.append(uct)
                 path_qs.append(node.Q)
                 path_rewards.append(node.reward)
-            
+
             paths_nodes.append(path)
             paths_qs.append(path_qs)
             paths_rewards.append(path_rewards)
             paths_ucts.append(path_ucts)
-            
+
             if (i + 1) % 5 == 0 or i < 3:  # Log first 3 and every 5th
                 self.logger.info(f"\nPath {i}: depth={len(path)-1}")
                 self.logger.info(f"  Mean UCT: {np.mean(path_ucts):.4f} | Mean Q: {np.mean(path_qs):.4f} | Mean Reward: {np.mean(path_rewards):.4f}")
-        
+
         # Rank paths by mean Q and mean reward
         qs_rank = np.argsort([np.mean(row) for row in paths_qs])[::-1].tolist()
         rewards_rank = np.argsort([np.mean(row) for row in paths_rewards])[::-1].tolist()
-        
+
         best_q_path = paths_nodes[qs_rank[0]] if qs_rank else [self.root]
         best_reward_path = paths_nodes[rewards_rank[0]] if rewards_rank else [self.root]
-        
+
         # Get top-k nodes by reward
         top_k_reward_nodes = sorted(self.all_nodes, key=lambda node: node.reward, reverse=True)[:min(5, len(self.all_nodes))]
-        
+
         # Select best node from best_reward_path (highest reward)
         selected_node = sorted(best_reward_path, key=lambda node: node.reward, reverse=True)[0]
-        
+
         self.logger.info("\n" + "="*80)
         self.logger.info("PATH ANALYSIS SUMMARY")
         self.logger.info("="*80)
@@ -916,7 +639,7 @@ class MCTSPromptOptimizerFeedback:
         self.logger.info(f"\nTop-5 nodes by reward:")
         for i, node in enumerate(top_k_reward_nodes, 1):
             self.logger.info(f"  {i}. Reward: {node.reward:.4f}, Q: {node.Q:.4f}, Visits: {node.N}, Depth: {node.depth}")
-        
+
         return {
             'all_paths': paths_nodes,
             'all_nodes': self.all_nodes,
@@ -926,6 +649,3 @@ class MCTSPromptOptimizerFeedback:
             'best_reward_path_last_node': [best_reward_path[-1]],
             'best_reward_path_selected_node': [selected_node],
         }
-
-
-
