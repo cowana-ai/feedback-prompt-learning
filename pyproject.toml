@@ -38,7 +38,6 @@ dependencies = [
     "tqdm>=4.65.0",
     "python-dotenv>=1.0.0",
     "pytest>=9.0.1",
-    "torch>=2.9.1",
     "nltk>=3.9.2",
     "tiktoken>=0.12.0",
 ]
