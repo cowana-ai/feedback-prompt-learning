@@ -157,7 +157,7 @@ class MCTSPromptOptimizerFeedback:
         # Initialize root - evaluate on eval batch for unbiased reward
         # Root is at depth 0, get eval batch for it
         eval_batch = self.world_model.get_fixed_eval_batch(0)
-        self.root.reward, eval_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, eval_batch)
+        self.root.reward, eval_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, eval_batch, eval=True)
 
         # Also get train batch for gradient analysis
         train_batch = self.world_model.get_batch('train')
@@ -258,11 +258,12 @@ class MCTSPromptOptimizerFeedback:
 
         # Store evaluations in parent node for tracking
         node.all_evaluations.extend(batch_feedback)
-
+        self.logger.debug(f"Feedback:\n{'\n'.join([res.feedback.reasoning_feedback for res in batch_feedback if res.feedback and res.feedback.reasoning_feedback])}")
         # Ask LLM to analyze errors and generate gradient (improvement direction)
         gradient, sampled_example_string = await self._get_action_decisions(
             node.prompt, node.all_evaluations
         )
+        self.logger.debug(f"Generated gradient: {gradient}")
         assert len(sampled_example_string) > 0, "Example string should not be empty"
 
         # Generate num_samples prompts from this gradient
@@ -273,7 +274,7 @@ class MCTSPromptOptimizerFeedback:
             self.num_samples,
             sampled_example_string
         )
-
+        self.logger.debug(f"Generated new prompts: {new_prompts}")
         return new_prompts
 
     async def _expand(self, node: MCTSNode) -> list[MCTSNode]:
@@ -310,7 +311,7 @@ class MCTSPromptOptimizerFeedback:
         eval_batch = self.world_model.get_fixed_eval_batch(child_depth)
 
         # Evaluate all new prompts in parallel
-        eval_tasks = [self.world_model.evaluate_prompt(prompt, eval_batch) for prompt in all_new_prompts]
+        eval_tasks = [self.world_model.evaluate_prompt(prompt, eval_batch, eval=True) for prompt in all_new_prompts]
         eval_results = await asyncio.gather(*eval_tasks)
 
         # Create child nodes with eval results
