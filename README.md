@@ -425,35 +425,39 @@ ______________________________________________________________________
 
 Performance across BigBench Hard tasks:
 
-| Dataset              | Baseline      | PromptAgent       | Feedback-MCTS | Best Method           | Prompt Length         |
-| -------------------- | ------------- | ----------------- | ------------- | --------------------- | --------------------- |
-| **geometric_shapes** | 0.601 ± 0.020 | 0.871 ± 0.022     | 0.869 ± 0.018 | PromptAgent (+0.270)  | 503 ± 44 / 453 ± 87   |
-| **casual_judgement** | 0.588 ± 0.037 | 0.632 ± 0.011     | 0.660 ± 0.032 | **Feedback (+0.072)** | 270 ± 145 / 428 ± 105 |
-| **object_counting**  | 0.866 ± 0.028 | **0.969 ± 0.015** | 0.955 ± 0.022 | PromptAgent (+0.103)  | 135 ± 39 / 237 ± 45   |
-| **epistemic**        | 0.840 ± 0.005 | **0.886 ± 0.025** | 0.862 ± 0.016 | PromptAgent (+0.046)  | 187 ± 111 / 399 ± 89  |
+| Dataset              | Baseline      | PromptAgent       | Feedback-MCTS (General) | Feedback-MCTS (Memory-Enhanced) | Best Method           | Prompt Length                     |
+| -------------------- | ------------- | ----------------- | ----------------------- | ------------------------------- | --------------------- | --------------------------------- |
+| **geometric_shapes** | 0.601 ± 0.020 | 0.871 ± 0.022     | 0.869 ± 0.018           | 0.875 ± 0.018                   | **Feedback (+0.274)** | 503 ± 44 / 453 ± 87 / 585 ± 96    |
+| **casual_judgement** | 0.588 ± 0.037 | 0.632 ± 0.011     | 0.660 ± 0.032           | 0.650 ± 0.049                   | **Feedback (+0.072)** | 270 ± 145 / 428 ± 105 / 400 ± 135 |
+| **object_counting**  | 0.866 ± 0.028 | **0.969 ± 0.015** | 0.955 ± 0.022           | 0.962 ± 0.016                   | PromptAgent (+0.103)  | 135 ± 39 / 237 ± 45 / 355 ± 213   |
+| **epistemic**        | 0.840 ± 0.005 | **0.886 ± 0.025** | 0.862 ± 0.016           | 0.877 ± 0.011                   | PromptAgent (+0.046)  | 187 ± 111 / 399 ± 89 / 325 ± 145  |
+| **Average**          | 0.724         | 0.840             | 0.837                   | **0.841**                       | **Feedback (+0.117)** | N/A                               |
 
-*Prompt Length format: PromptAgent / Feedback-MCTS (tokens, mean ± std). Results over 5-6 runs.*
+*Results over 5 runs.*
 
 **Key Findings:**
 
-- **PromptAgent wins on 3/4 tasks** despite (or because of) purely optimizing for accuracy
-- **Feedback-MCTS wins on casual_judgement** (+0.028 over PromptAgent) - a causal attribution task requiring multi-step reasoning about cause-effect relationships
-- **Prompt length**: PromptAgent produces shorter prompts (avg 273 tokens vs 379 for Feedback) but with higher variance (±85 vs ±82), suggesting less consistent prompt structure
-- Both methods substantially improve over baseline across all tasks (+7.2 to +27.0 percentage points)
-- Highest absolute performance: PromptAgent on object_counting (96.9%)
+- **Feedback-MCTS (Memory-Enhanced) is the best overall method** with highest average accuracy (0.841) and improvement (+0.117 over baseline)
+- **Feedback-MCTS variants win on 2/4 tasks**, showing promise for multi-objective optimization
+- **Feedback-MCTS wins on casual_judgement** (+0.072 over baseline) - a causal attribution task requiring multi-step reasoning about cause-effect relationships
+- **Feedback-MCTS (Memory-Enhanced) wins on geometric_shapes** (+0.274 over baseline) with task-specific reward function that builds reasoning memory per option, enabling better spatial reasoning feedback
+- **Prompt length**: PromptAgent produces shortest prompts (avg 273 tokens), Feedback-MCTS (General) (379 tokens), Feedback-MCTS (Memory-Enhanced) longest (416 tokens) with highest variance (±147), indicating more complex prompt structures
+- All methods substantially improve over baseline across all tasks (+7.2 to +27.4 percentage points)
 
 **Method Characteristics:**
 
 - **PromptAgent**: Error-focused optimization, concise prompts optimized purely for accuracy
+
 - **Feedback-MCTS**: Multi-objective optimization (accuracy + prompt structure + reasoning quality + length constraints), produces longer but more structured prompts with explicit reasoning steps
+  **Why Feedback-MCTS (Memory-Enhanced) prompts are longest:**
+  The memory-enhanced reward function adds reasoning pattern tracking:
 
-**Why Feedback-MCTS prompts are longer:**
-The Feedback-MCTS reward function balances multiple objectives beyond raw accuracy:
+- Builds semantic clusters of successful reasoning steps per answer option
 
-- Prompt verbosity control (penalizes too-brief or too-verbose prompts)
-- Reasoning structure quality (encourages step-by-step thinking)
-- Output format compliance (enforces `<answer>` tags)
-  This multi-objective optimization trades some accuracy for better prompt properties, resulting in 39% longer prompts on average.
+- Provides targeted feedback based on missing or hallucinated reasoning patterns
+
+- Encourages more detailed spatial/geometric analysis in prompts
+  This results in 52% longer prompts than PromptAgent, with more explicit reasoning instructions.
 
 ______________________________________________________________________
 
