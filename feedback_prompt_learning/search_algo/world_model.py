@@ -88,21 +88,12 @@ class WorldModel(ABC):
         self,
         raw_output: str,
         target: str,
-        prompt: str
+        prompt: str,
+        input_text: str
     ) -> RewardOutput:
         """Calculate reward using reward function"""
         cleaned_output = self.clean_response_fn(raw_output)
-
-        # Check if reward function accepts raw_output parameter
-        import inspect
-        sig = inspect.signature(self.reward_fn)
-        if 'raw_output' in sig.parameters:
-            output = self.reward_fn(
-                cleaned_output, target, prompt, raw_output=raw_output
-            )
-        else:
-            output = self.reward_fn(cleaned_output, target, prompt)
-
+        output = self.reward_fn(cleaned_output, target, prompt, raw_output, input_text)
         # Handle both old tuple format and new RewardOutput
         if isinstance(output, RewardOutput):
             return output
@@ -251,7 +242,8 @@ class PromptOptimizationWorldModel(WorldModel):
     async def evaluate_prompt(
         self,
         prompt: str,
-        dataset: list[tuple[str, str]]
+        dataset: list[tuple[str, str]],
+        eval: bool = False
     ) -> tuple[float, list[EvaluationResult]]:
         """
         Evaluate a prompt on a batch of data.
@@ -276,7 +268,7 @@ class PromptOptimizationWorldModel(WorldModel):
             # Calculate scores and collect feedback
             for response, (input_text, target) in zip(responses, batch):
                 raw_output = response.content
-                reward_output = self.calculate_reward(raw_output, target, prompt)
+                reward_output = self.calculate_reward(raw_output, target, prompt, input_text if not eval else "")
                 scores.append(reward_output.score)
 
                 evaluation = EvaluationResult(
@@ -336,7 +328,8 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
     async def evaluate_prompt(
         self,
         prompt: str,
-        dataset: list[tuple[str, str]]
+        dataset: list[tuple[str, str]],
+        eval: bool = False
     ) -> tuple[float, list[dict]]:
         """
         Evaluate a prompt on the entire dataset with batched inference.
@@ -366,7 +359,7 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
             # Calculate scores and collect feedback
             for response, (input_text, target) in zip(responses, batch):
                 raw_output = response.content
-                reward_output = self.calculate_reward(raw_output, target, prompt)
+                reward_output = self.calculate_reward(raw_output, target, prompt, input_text if not eval else "")
                 scores.append(reward_output.score)
                 evaluation = EvaluationResult(
                     input=input_text,
