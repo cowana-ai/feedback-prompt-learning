@@ -258,7 +258,11 @@ class MCTSPromptOptimizerFeedback:
 
         # Store evaluations in parent node for tracking
         node.all_evaluations.extend(batch_feedback)
-        self.logger.debug(f"Feedback:\n{''.join([res.feedback.reasoning_feedback + '\n' for res in batch_feedback if res.feedback and res.feedback.reasoning_feedback])}")
+        # TODO: Consider refactoring this
+        newline = '\n'
+        self.logger.debug(f"""Feedback:
+        {''.join([res.feedback.reasoning_feedback + newline for res in batch_feedback if res.feedback and res.feedback.reasoning_feedback])}
+        """)
         # Ask LLM to analyze errors and generate gradient (improvement direction)
         gradient, sampled_example_string = await self._get_action_decisions(
             node.prompt, node.all_evaluations
