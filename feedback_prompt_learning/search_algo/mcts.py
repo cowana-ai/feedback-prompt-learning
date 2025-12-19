@@ -16,6 +16,7 @@ from tqdm import tqdm
 from feedback_prompt_learning import cfg
 from feedback_prompt_learning.data import EvaluationResult
 from feedback_prompt_learning.search_algo.world_model import WorldModel
+from feedback_prompt_learning.utils.similarity import jaccard_ngram
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +625,35 @@ class MCTSPromptOptimizerFeedback:
             if (i + 1) % 5 == 0 or i < 3:  # Log first 3 and every 5th
                 self.logger.info(f"\nPath {i}: depth={len(path)-1}")
                 self.logger.info(f"  Mean UCT: {np.mean(path_ucts):.4f} | Mean Q: {np.mean(path_qs):.4f} | Mean Reward: {np.mean(path_rewards):.4f}")
+
+        # =====================
+        # Depth-Aligned Lexical Similarity Analysis (Jaccard bigram)
+        # =====================
+
+        # Only consider paths with more than 1 node
+        all_path_prompts = [[node.prompt for node in path] for path in paths_nodes if len(path) > 1]
+        if all_path_prompts:
+            # Find minimum common depth
+            min_depth = min(len(prompts) for prompts in all_path_prompts)
+            # Truncate all paths to min_depth
+            truncated_paths = [prompts[:min_depth] for prompts in all_path_prompts]
+            # Intra-path: mean similarity between consecutive prompts in each path
+            intra_sims = []
+            for prompts in truncated_paths:
+                sims = [jaccard_ngram(prompts[i], prompts[i+1], n=2) for i in range(min_depth-1)]
+                intra_sims.extend(sims)
+            # Inter-path: mean similarity between prompts at the same depth across all paths
+            inter_sims = []
+            for d in range(min_depth):
+                depth_prompts = [prompts[d] for prompts in truncated_paths]
+                for i in range(len(depth_prompts)):
+                    for j in range(i+1, len(depth_prompts)):
+                        inter_sims.append(jaccard_ngram(depth_prompts[i], depth_prompts[j], n=2))
+            mean_intra = np.mean(intra_sims) if intra_sims else 1.0
+            mean_inter = np.mean(inter_sims) if inter_sims else 1.0
+            self.logger.info(f"\nDepth-aligned lexical n-gram (bigram) similarity:")
+            self.logger.info(f"  Mean intra-path (consecutive, aligned) similarity: {mean_intra:.3f}")
+            self.logger.info(f"  Mean inter-path (same depth, aligned) similarity: {mean_inter:.3f}")
 
         # Rank paths by mean Q and mean reward
         qs_rank = np.argsort([np.mean(row) for row in paths_qs])[::-1].tolist()
