@@ -36,7 +36,7 @@ from feedback_prompt_learning.search_algo.world_model import (
 logger = logging.getLogger(__name__)
 
 # Constants
-STOP_WORDS = set(stopwords.words('english')) if 'stopwords' in nltk.corpus else None
+STOP_WORDS = None
 if STOP_WORDS is None:
     nltk.download('stopwords', quiet=True)
     STOP_WORDS = set(stopwords.words('english'))
@@ -229,7 +229,7 @@ def create_dataset(task: CustomTask) -> tuple[list[tuple[str, str]], list[tuple[
 def create_reward_function(
     train_data: list[tuple[str, str]],
     use_feedback: bool = True,
-    task_type: str = "general"
+    reward_type: str = "general"
 ) -> Any:
     """
     Create reward function for the task.
@@ -321,7 +321,7 @@ def create_reward_function(
             "example": best_example,
         }
 
-    if task_type != "general" and use_feedback:
+    if reward_type != "general" and use_feedback:
         def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
             """
             Geometric shapes specialized reward function.
@@ -414,7 +414,7 @@ def create_reward_function(
         return reward_fn
 
     if not use_feedback:
-        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "") -> RewardOutput:
+        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
             output_clean = output.strip().upper()
             target_clean = target.strip().upper()
 
@@ -423,7 +423,7 @@ def create_reward_function(
 
             return RewardOutput(score=score, feedback=feedback)
     else:
-        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "") -> RewardOutput:
+        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
             """
             Enhanced reward function with TF-IDF keyword analysis.
             Analyzes output after clean_response() processing.
@@ -557,7 +557,8 @@ async def evaluate_on_test_set(
 async def evaluate_dataset(
     dataset_name: str,
     method: str = "feedback",
-    config_path: str = None
+    config_path: str = None,
+    reward_type: str = "general"
 ):
     """
     Main evaluation function.
@@ -597,7 +598,7 @@ async def evaluate_dataset(
     logger.info(f"  Eval: {len(eval_data)} examples")
     logger.info(f"  Test: {len(test_data)} examples\n")
 
-    reward_fn = create_reward_function(train_data, use_feedback=use_feedback, task_type=dataset_name)
+    reward_fn = create_reward_function(train_data, use_feedback=use_feedback, reward_type=reward_type)
 
     project_root = Path(__file__).parent.parent.parent
     optimizer_config_path = project_root / "configs" / "optimizer" / f"{optimizer_config}.yaml"
@@ -777,6 +778,12 @@ if __name__ == "__main__":
         help="Path to datasets.yaml config file (optional)"
     )
     parser.add_argument(
+        "--reward_type",
+        type=str,
+        default="general",
+        help="Reward type to use (optional)"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging"
@@ -794,5 +801,6 @@ if __name__ == "__main__":
     asyncio.run(evaluate_dataset(
         dataset_name=args.dataset,
         method=args.method,
-        config_path=args.config
+        config_path=args.config,
+        reward_type=args.reward_type,
     ))
