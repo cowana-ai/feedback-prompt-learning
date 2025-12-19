@@ -21,7 +21,7 @@ from feedback_prompt_learning.search_algo import *  # noqa: F401, F403
 def load_config(verbose=False):
     """Load configuration using Hydra"""
     # Use relative path to configs directory (relative to package root)
-    with initialize(version_base="1.3.2", config_path="../configs"):
+    with initialize(version_base="1.3.2", config_path="./configs"):
         cfg = compose(config_name="config", overrides=["optimizer=mcts"])
         if verbose:
             print(OmegaConf.to_yaml(cfg))
@@ -37,4 +37,3 @@ __all__ = [
     "cfg",
     "load_config",
 ]
-
