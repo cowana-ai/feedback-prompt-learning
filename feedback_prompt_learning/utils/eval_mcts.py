@@ -49,23 +49,9 @@ EMBEDDINGS_MODEL = OpenAIEmbeddings(model="text-embedding-3-small")
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def load_dataset_config(dataset_name: str, config_path: str = None) -> dict[str, Any]:
-    """Load dataset configuration from YAML file."""
-    if config_path is None:
-        project_root = Path(__file__).parent.parent.parent
-        config_path = project_root / "configs" / "datasets.yaml"
-
-    with open(config_path) as f:
-        all_configs = yaml.safe_load(f)
-
-    if dataset_name not in all_configs['datasets']:
-        available = list(all_configs['datasets'].keys())
-        raise ValueError(f"Unknown dataset: {dataset_name}. Available: {available}")
-
-    config = all_configs['datasets'][dataset_name]
-    project_root = Path(__file__).parent.parent.parent
-    config['data_dir'] = str(project_root / config['data_path'])
-    return config
+def load_dataset_config(dataset_name: str) -> dict[str, Any]:
+    import feedback_prompt_learning
+    return feedback_prompt_learning.cfg.datasets[dataset_name]
 
 
 def count_tokens_gpt4o_mini(text: str) -> int:
@@ -556,7 +542,6 @@ async def evaluate_on_test_set(
 async def evaluate_dataset(
     dataset_name: str,
     method: str = "feedback",
-    config_path: str = None,
     reward_type: str = "general"
 ):
     """
@@ -567,7 +552,7 @@ async def evaluate_dataset(
         method: 'promptagent' or 'feedback' (default)
         config_path: Optional custom path to datasets.yaml
     """
-    config = load_dataset_config(dataset_name, config_path)
+    config = load_dataset_config(dataset_name)
     use_feedback = (method == "feedback")
     optimizer_config = "mcts_feedback" if method == "feedback" else "mcts_promptagent"
 
@@ -576,7 +561,7 @@ async def evaluate_dataset(
     logger.info("="*80)
     logger.info(f"Dataset: {config['name']}")
     logger.info(f"Description: {config['description']}")
-    logger.info(f"Data file: {config['data_dir']}")
+    logger.info(f"Data file: {config['data_path']}")
     logger.info(f"Optimizer config: optimizer/{optimizer_config}.yaml\n")
 
     task = CustomTask(
@@ -586,7 +571,7 @@ async def evaluate_dataset(
         seed=config['seed'],
         task_name=config['name'],
         task_description=config['description'],
-        data_dir=config['data_dir'],
+        data_dir=config['data_path'],
         post_instruction=config['post_instruction']
     )
 
@@ -599,8 +584,8 @@ async def evaluate_dataset(
 
     reward_fn = create_reward_function(train_data, use_feedback=use_feedback, reward_type=reward_type)
 
-    project_root = Path(__file__).parent.parent.parent
-    optimizer_config_path = project_root / "configs" / "optimizer" / f"{optimizer_config}.yaml"
+
+    optimizer_config_path = f"feedback_prompt_learning/configs/optimizer/{optimizer_config}.yaml"
     optimizer_cfg = OmegaConf.load(optimizer_config_path)
 
     llm = hydra_instantiate(optimizer_cfg.llm.student)
@@ -771,12 +756,6 @@ if __name__ == "__main__":
         help="Optimization method (default: feedback)"
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to datasets.yaml config file (optional)"
-    )
-    parser.add_argument(
         "--reward_type",
         type=str,
         default="general",
@@ -800,6 +779,5 @@ if __name__ == "__main__":
     asyncio.run(evaluate_dataset(
         dataset_name=args.dataset,
         method=args.method,
-        config_path=args.config,
         reward_type=args.reward_type,
     ))

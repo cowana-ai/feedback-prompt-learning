@@ -2,6 +2,7 @@
 
 defaults:
   - optimizer: mcts
+  - datasets.yaml
 
 # Global settings
 seed: 42
