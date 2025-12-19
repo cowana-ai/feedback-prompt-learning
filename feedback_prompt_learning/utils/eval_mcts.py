@@ -321,7 +321,82 @@ def create_reward_function(
             "example": best_example,
         }
 
-    if reward_type != "general" and use_feedback:
+    if not use_feedback:
+        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
+            output_clean = output.strip().upper()
+            target_clean = target.strip().upper()
+
+            score = 1.0 if output_clean == target_clean else 0.0
+            feedback = Feedback(accuracy_feedback="Correct" if score == 1.0 else "Incorrect")
+
+            return RewardOutput(score=score, feedback=feedback)
+    elif reward_type == "general":
+        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
+            """
+            Enhanced reward function with TF-IDF keyword analysis.
+            Analyzes output after clean_response() processing.
+            Checks if model's raw response mentions discriminative keywords identified via TF-IDF.
+            Provides feedback on correctness and reasoning quality.
+            """
+            output_clean = output.strip().upper()
+            target_clean = target.strip().upper()
+
+            if output_clean == target_clean:
+                accuracy = 1.0
+                accuracy_feedback = "Correct answer ✓"
+            else:
+                accuracy = 0.0
+                issues = []
+
+                has_valid_answer = any(possible_target in output_clean for possible_target in unique_targets)
+
+                if not has_valid_answer:
+                    issues.append(f"Format error: clean_response() could not extract answer, possible answers are {', '.join(unique_targets)}. Model's output must either: (1) use <answer>X</answer> tags with letter inside, OR (2) contain a clear option letter (A-E) or (A)-(E) format, OR (3) match one of the option text strings. Prompt should specify: 'Provide your reasoning, then output your final answer as <answer>X</answer> .'")
+                else:
+                    wrong_answer = output_clean
+                    issues.append(f"Wrong answer extracted: '{wrong_answer}' instead of '{target_clean}'. Identify what went wrong in current reasoning and propose critical domain knowledge to improve reasoning process on this kind of problem.")
+
+                accuracy_feedback = f"Incorrect. Related issues: {' | '.join(issues)}"
+
+            reasoning_feedback = []
+            has_answer_tags = '<answer>' in prompt.lower()
+            if not has_answer_tags:
+                reasoning_feedback.append("Should specify <answer>X</answer> tag format for reliable extraction")
+
+            if raw_output and accuracy == 0.0:
+                raw_lower = raw_output.lower()
+
+                step_indicators = [
+                    'first', 'second', 'third', 'finally',
+                    'step',  '1', '2', '3',
+                    'let me', 'let\'s',
+                ]
+                has_structured_thinking = sum(1 for indicator in step_indicators if indicator in raw_lower)
+                if has_structured_thinking >= 2:
+                    reasoning_feedback.append(f"Uses structured thinking ({has_structured_thinking} step indicators) ✓")
+                else:
+                    reasoning_feedback.append(
+                        "Response lacks structured approach. LLM struggles to solve this kind of problem. Try to break down reasoning step-by-step."
+                    )
+
+            if not reasoning_feedback and accuracy == 0.0:
+                reasoning_feedback.append(
+                    "Reasoning structure looks okay but conclusion was wrong. Consider adding domain-specific guidance on solving this issue (e.g., 'A pentagon has 5 vertices')"
+                )
+
+            prompt_feedback = []
+            prompt_verbosity_feedback = evaluate_prompt_verbosity(prompt)
+            prompt_feedback.append(f"Prompt verbosity status: {prompt_verbosity_feedback['status']}. Recommendation: {prompt_verbosity_feedback['recommendation']}")
+
+            total_score = accuracy
+
+            feedback = Feedback(
+                accuracy_feedback=accuracy_feedback,
+                reasoning_feedback=', '.join(reasoning_feedback) if reasoning_feedback else None,
+                prompt_feedback=', '.join(prompt_feedback) if prompt_feedback else None,
+            )
+            return RewardOutput(score=total_score, feedback=feedback)
+    elif reward_type == "memory_enhanced":
         def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
             """
             Geometric shapes specialized reward function.
@@ -410,84 +485,8 @@ def create_reward_function(
             )
 
             return RewardOutput(score=score, feedback=feedback)
-
-        return reward_fn
-
-    if not use_feedback:
-        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
-            output_clean = output.strip().upper()
-            target_clean = target.strip().upper()
-
-            score = 1.0 if output_clean == target_clean else 0.0
-            feedback = Feedback(accuracy_feedback="Correct" if score == 1.0 else "Incorrect")
-
-            return RewardOutput(score=score, feedback=feedback)
     else:
-        def reward_fn(output: str, target: str, prompt: str, raw_output: str = "", question: str = "") -> RewardOutput:
-            """
-            Enhanced reward function with TF-IDF keyword analysis.
-            Analyzes output after clean_response() processing.
-            Checks if model's raw response mentions discriminative keywords identified via TF-IDF.
-            Provides feedback on correctness and reasoning quality.
-            """
-            output_clean = output.strip().upper()
-            target_clean = target.strip().upper()
-
-            if output_clean == target_clean:
-                accuracy = 1.0
-                accuracy_feedback = "Correct answer ✓"
-            else:
-                accuracy = 0.0
-                issues = []
-
-                has_valid_answer = any(possible_target in output_clean for possible_target in unique_targets)
-
-                if not has_valid_answer:
-                    issues.append(f"Format error: clean_response() could not extract answer, possible answers are {', '.join(unique_targets)}. Model's output must either: (1) use <answer>X</answer> tags with letter inside, OR (2) contain a clear option letter (A-E) or (A)-(E) format, OR (3) match one of the option text strings. Prompt should specify: 'Provide your reasoning, then output your final answer as <answer>X</answer> .'")
-                else:
-                    wrong_answer = output_clean
-                    issues.append(f"Wrong answer extracted: '{wrong_answer}' instead of '{target_clean}'. Identify what went wrong in current reasoning and propose critical domain knowledge to improve reasoning process on this kind of problem.")
-
-                accuracy_feedback = f"Incorrect. Related issues: {' | '.join(issues)}"
-
-            reasoning_feedback = []
-            has_answer_tags = '<answer>' in prompt.lower()
-            if not has_answer_tags:
-                reasoning_feedback.append("Should specify <answer>X</answer> tag format for reliable extraction")
-
-            if raw_output and accuracy == 0.0:
-                raw_lower = raw_output.lower()
-
-                step_indicators = [
-                    'first', 'second', 'third', 'finally',
-                    'step',  '1', '2', '3',
-                    'let me', 'let\'s',
-                ]
-                has_structured_thinking = sum(1 for indicator in step_indicators if indicator in raw_lower)
-                if has_structured_thinking >= 2:
-                    reasoning_feedback.append(f"Uses structured thinking ({has_structured_thinking} step indicators) ✓")
-                else:
-                    reasoning_feedback.append(
-                        "Response lacks structured approach. LLM struggles to solve this kind of problem. Try to break down reasoning step-by-step."
-                    )
-
-            if not reasoning_feedback and accuracy == 0.0:
-                reasoning_feedback.append(
-                    "Reasoning structure looks okay but conclusion was wrong. Consider adding domain-specific guidance on solving this issue (e.g., 'A pentagon has 5 vertices')"
-                )
-
-            prompt_feedback = []
-            prompt_verbosity_feedback = evaluate_prompt_verbosity(prompt)
-            prompt_feedback.append(f"Prompt verbosity status: {prompt_verbosity_feedback['status']}. Recommendation: {prompt_verbosity_feedback['recommendation']}")
-
-            total_score = accuracy
-
-            feedback = Feedback(
-                accuracy_feedback=accuracy_feedback,
-                reasoning_feedback=', '.join(reasoning_feedback) if reasoning_feedback else None,
-                prompt_feedback=', '.join(prompt_feedback) if prompt_feedback else None,
-            )
-            return RewardOutput(score=total_score, feedback=feedback)
+        raise ValueError(f"Unknown reward_type: {reward_type}. Supported types: 'general', 'memory_enhanced'")
 
     return reward_fn
 
