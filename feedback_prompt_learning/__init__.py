@@ -1,17 +1,4 @@
-"""
-Feedback-Prompt-Learning: An evaluation-driven framework for automatic prompt optimization.
-
-This package provides tools for optimizing prompts through iterative feedback,
-enabling systematic improvement based on evaluation criteria rather than trial-and-error.
-"""
-
 __version__ = "0.1.0"
-__author__ = "Chingis Oinar"
-__email__ = "your.email@example.com"
-
-import os
-from pathlib import Path
-
 from hydra import compose, initialize
 from omegaconf import OmegaConf
 
