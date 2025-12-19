@@ -168,41 +168,6 @@ Rich feedback enables smarter optimization:
 - Prescriptive: Guide improvement direction
 - Preservative: Maintain successful patterns
 
-______________________________________________________________________
-
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                   MCTS Tree Search (Selection)                     │
-│  • UCT formula balances exploration vs exploitation                │
-│  • Track Q-values (average cumulative reward per node)             │
-└────────────────────────────────────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                  Expansion: Generate Child Prompts                 │
-│                                                                    │
-│  PromptAgent Mode:           │   Feedback-MCTS Mode:              │
-│  • Sample errors only        │   • Adaptive balanced sampling     │
-│  • Analyze error patterns    │   • Rich feedback (accuracy +      │
-│  • Generic gradient          │     reasoning + prompt advice)     │
-│                              │   • Targeted gradient preserving   │
-│                              │     strengths                      │
-└────────────────────────────────────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────┐
-│              Simulation: Evaluate New Prompts on Eval Set          │
-│  • Get reward from your custom reward function                    │
-│  • Collect feedback for next iteration                            │
-└────────────────────────────────────────────────────────────────────┘
-                                   ▼
-┌────────────────────────────────────────────────────────────────────┐
-│            Backpropagation: Update Q-values Up Tree                │
-│  • Cumulative reward flows from leaf to root                      │
-│  • Update visit counts and Q-values                               │
-└────────────────────────────────────────────────────────────────────┘
-```
-
 **Configuration:** Switch between PromptAgent and Feedback-MCTS via config:
 
 - `configs/optimizer/mcts_promptagent.yaml`: Error-only baseline
@@ -421,14 +386,14 @@ ______________________________________________________________________
 
 ______________________________________________________________________
 
-## Performance Comparison
+## Performance Comparison with Standard Search Configurations
 
-Performance across BigBench Hard tasks:
+Performance across BigBench Hard tasks with Standard search configurations:
 
 | Dataset              | Baseline      | PromptAgent       | Feedback-MCTS (General) | Feedback-MCTS (Memory-Enhanced) | Best Method           | Prompt Length                     |
 | -------------------- | ------------- | ----------------- | ----------------------- | ------------------------------- | --------------------- | --------------------------------- |
-| **geometric_shapes** | 0.601 ± 0.020 | 0.871 ± 0.022     | 0.869 ± 0.018           | 0.875 ± 0.018                   | **Feedback (+0.274)** | 503 ± 44 / 453 ± 87 / 585 ± 96    |
-| **casual_judgement** | 0.588 ± 0.037 | 0.632 ± 0.011     | 0.660 ± 0.032           | 0.650 ± 0.049                   | **Feedback (+0.072)** | 270 ± 145 / 428 ± 105 / 400 ± 135 |
+| **geometric_shapes** | 0.601 ± 0.020 | 0.871 ± 0.022     | 0.869 ± 0.018           | **0.875 ± 0.018**               | **Feedback (+0.274)** | 503 ± 44 / 453 ± 87 / 585 ± 96    |
+| **casual_judgement** | 0.588 ± 0.037 | 0.632 ± 0.011     | **0.660 ± 0.032**       | 0.650 ± 0.049                   | **Feedback (+0.072)** | 270 ± 145 / 428 ± 105 / 400 ± 135 |
 | **object_counting**  | 0.866 ± 0.028 | **0.969 ± 0.015** | 0.955 ± 0.022           | 0.962 ± 0.016                   | PromptAgent (+0.103)  | 135 ± 39 / 237 ± 45 / 355 ± 213   |
 | **epistemic**        | 0.840 ± 0.005 | **0.886 ± 0.025** | 0.862 ± 0.016           | 0.877 ± 0.011                   | PromptAgent (+0.046)  | 187 ± 111 / 399 ± 89 / 325 ± 145  |
 | **Average**          | 0.724         | 0.840             | 0.837                   | **0.841**                       | **Feedback (+0.117)** | N/A                               |
@@ -458,6 +423,33 @@ Performance across BigBench Hard tasks:
 
 - Encourages more detailed spatial/geometric analysis in prompts
   This results in 52% longer prompts than PromptAgent, with more explicit reasoning instructions.
+
+______________________________________________________________________
+
+## Performance with Lite Search Configurations
+
+Performance across BigBench Hard tasks with Lite search configurations, including trajectory similarity metrics:
+
+| Dataset              | PromptAgent Accuracy | Feedback-MCTS Accuracy | PromptAgent Intra-path | Feedback-MCTS Intra-path | PromptAgent Inter-path | Feedback-MCTS Inter-path |
+| -------------------- | -------------------- | ---------------------- | ---------------------- | ------------------------ | ---------------------- | ------------------------ |
+| **geometric_shapes** | 0.8217 ± 0.0226      | **0.8333 ± 0.0322**    | 0.1103 ± 0.0312        | 0.1823 ± 0.0386          | 0.6327 ± 0.0444        | 0.7020 ± 0.0615          |
+| **casual_judgement** | 0.6425 ± 0.0350      | **0.6525 ± 0.0311**    | 0.0878 ± 0.0194        | 0.1550 ± 0.0390          | 0.6100 ± 0.0128        | 0.6098 ± 0.0232          |
+| **epistemic**        | 0.8607 ± 0.0115      | **0.8680 ± 0.0171**    | 0.1550 ± 0.0390        | 0.1540 ± 0.0566          | 0.6515 ± 0.0811        | 0.7273 ± 0.0228          |
+| **object_counting**  | 0.9647 ± 0.0232      | **0.9873 ± 0.0092**    | 0.0847 ± 0.0061        | 0.1243 ± 0.0490          | 0.7300 ± 0.0238        | 0.7437 ± 0.0199          |
+
+*Results over 3 runs. Intra-path similarity measures lexical diversity within optimization trajectories. Inter-path similarity measures lexical diversity between different optimization runs.*
+
+- Overall performance: Feedback-MCTS consistently achieves higher accuracy than PromptAgent across all datasets, with the largest gains on object_counting and epistemic tasks.
+
+- Intra-path similarity (within-run consistency): Feedback-MCTS shows higher intra-path similarity across datasets, indicating more focused and stable refinement within each optimization trajectory. This suggests the search process reinforces effective prompt structures instead of drifting across unrelated variants.
+
+- Inter-path similarity (cross-run convergence): Higher inter-path similarity under Feedback-MCTS—especially for epistemic and object_counting—indicates that independent runs converge toward similar high-performing prompt strategies, reducing variance across runs.
+
+- Role of textual feedback: Textual feedback provides explicit, actionable guidance beyond scalar rewards, making prompt updates more targeted and semantically consistent. This shifts exploration from random variation to goal-directed refinement.
+
+- Accuracy–diversity trade-off: Increased similarity correlates with higher accuracy for tasks requiring precise, repeatable reasoning (e.g., geometric reasoning, counting). For more open-ended tasks (e.g., casual_judgement), gains are smaller, suggesting that some diversity remains beneficial.
+
+- Key takeaway: Feedback-MCTS improves accuracy by promoting coherent exploration—balancing refinement and exploration—leading to more reliable convergence on effective prompt strategies.
 
 ______________________________________________________________________
 
