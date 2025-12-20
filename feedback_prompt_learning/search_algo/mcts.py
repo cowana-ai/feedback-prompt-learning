@@ -5,7 +5,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from os import access
 from typing import Optional
 
 import numpy as np
