@@ -2,7 +2,8 @@
 # Use this as the default, or override with mcts_feedback.yaml or mcts_promptagent.yaml
 
 defaults:
-  - mcts_promptagent  # Options: mcts_promptagent (error-only) or mcts_feedback (feedback-based)
+  - _self_
+  - search_algo: mcts_promptagent  # Options: mcts_promptagent (error-only) or mcts_feedback (feedback-based)
 
 # MCTS-specific parameters
 num_iterations: 12
@@ -30,6 +31,26 @@ llm:
 
 sample_examples:
   num_historical: 5
+
+# Example formatting templates
+example_format:
+  header: "Total evaluations: {total}\nShowing {shown} evaluated examples:\n"
+
+  with_feedback: |
+
+    Example {index} (Score: {score:.2f}):
+    Question: {input}
+    LLM Output: {output}
+    Expected: {target}
+    Accuracy Feedback: {accuracy_feedback}
+    Reasoning Feedback: {reasoning_feedback}
+
+  without_feedback: |
+
+    Example {index} (Score: {score:.2f}):
+    Question: {input}
+    LLM Output: {output}
+    Expected: {target}
 
 # Note: gradient_analysis_prompt and prompt_generation_prompt are now loaded from:
 # - mcts_promptagent.yaml (default): Simple error analysis for PromptAgent

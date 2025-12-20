@@ -6,25 +6,21 @@ Supports both PromptAgent and Feedback-MCTS algorithms with easy method switchin
 import argparse
 import asyncio
 import logging
-import os
 import re
 from collections import defaultdict
-from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import nltk
 import numpy as np
 import spacy
 import tiktoken
-import yaml
 from hydra.utils import instantiate as hydra_instantiate
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_openai import OpenAIEmbeddings
 from nltk.corpus import stopwords
-from omegaconf import OmegaConf
 from tqdm import tqdm
 
-# Don't import cfg at module level to avoid Hydra initialization
+from feedback_prompt_learning import config
 from feedback_prompt_learning.data import Feedback, RewardOutput
 from feedback_prompt_learning.data.task.bigbench import CustomTask
 from feedback_prompt_learning.search_algo.mcts import \
@@ -49,24 +45,9 @@ EMBEDDINGS_MODEL = OpenAIEmbeddings(model="text-embedding-3-small")
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def load_dataset_config(dataset_name: str, config_path: str = None) -> dict[str, Any]:
-    """Load dataset configuration from YAML file."""
-    if config_path is None:
-        project_root = Path(__file__).parent.parent.parent
-        config_path = project_root / "configs" / "datasets.yaml"
-
-    with open(config_path) as f:
-        all_configs = yaml.safe_load(f)
-
-    if dataset_name not in all_configs['datasets']:
-        available = list(all_configs['datasets'].keys())
-        raise ValueError(f"Unknown dataset: {dataset_name}. Available: {available}")
-
-    config = all_configs['datasets'][dataset_name]
-    project_root = Path(__file__).parent.parent.parent
-    config['data_dir'] = str(project_root / config['data_path'])
-    return config
-
+def load_dataset_config(dataset_name: str) -> dict[str, Any]:
+    dataset_cfg = config._cfg.datasets[dataset_name]
+    return dataset_cfg
 
 def count_tokens_gpt4o_mini(text: str) -> int:
     """Calculate the number of tokens in a given text using GPT-4o Mini encoding."""
@@ -556,7 +537,6 @@ async def evaluate_on_test_set(
 async def evaluate_dataset(
     dataset_name: str,
     method: str = "feedback",
-    config_path: str = None,
     reward_type: str = "general"
 ):
     """
@@ -567,27 +547,24 @@ async def evaluate_dataset(
         method: 'promptagent' or 'feedback' (default)
         config_path: Optional custom path to datasets.yaml
     """
-    config = load_dataset_config(dataset_name, config_path)
+    dataset_config = load_dataset_config(dataset_name)
     use_feedback = (method == "feedback")
-    optimizer_config = "mcts_feedback" if method == "feedback" else "mcts_promptagent"
-
     logger.info("="*80)
     logger.info(f"MCTS OPTIMIZATION - {method.upper()} METHOD")
     logger.info("="*80)
-    logger.info(f"Dataset: {config['name']}")
-    logger.info(f"Description: {config['description']}")
-    logger.info(f"Data file: {config['data_dir']}")
-    logger.info(f"Optimizer config: optimizer/{optimizer_config}.yaml\n")
+    logger.info(f"Dataset: {dataset_config['name']}")
+    logger.info(f"Description: {dataset_config['description']}")
+    logger.info(f"Data file: {dataset_config['data_path']}")
 
     task = CustomTask(
-        train_size=config['train_size'],
-        eval_size=config['eval_size'],
-        test_size=config['test_size'],
-        seed=config['seed'],
-        task_name=config['name'],
-        task_description=config['description'],
-        data_dir=config['data_dir'],
-        post_instruction=config['post_instruction']
+        train_size=dataset_config['train_size'],
+        eval_size=dataset_config['eval_size'],
+        test_size=dataset_config['test_size'],
+        seed=dataset_config['seed'],
+        task_name=dataset_config['name'],
+        task_description=dataset_config['description'],
+        data_dir=dataset_config['data_path'],
+        post_instruction=dataset_config['post_instruction']
     )
 
     train_data, eval_data, test_data = create_dataset(task)
@@ -599,11 +576,10 @@ async def evaluate_dataset(
 
     reward_fn = create_reward_function(train_data, use_feedback=use_feedback, reward_type=reward_type)
 
-    project_root = Path(__file__).parent.parent.parent
-    optimizer_config_path = project_root / "configs" / "optimizer" / f"{optimizer_config}.yaml"
-    optimizer_cfg = OmegaConf.load(optimizer_config_path)
 
-    llm = hydra_instantiate(optimizer_cfg.llm.student)
+    config.reload([f"optimizer/search_algo=mcts_{method}"])
+
+    llm = hydra_instantiate(config._cfg.optimizer.llm.student)
 
     if method == "promptagent":
         world_model = PromptAgentWorldModel(
@@ -612,9 +588,9 @@ async def evaluate_dataset(
             llm=llm,
             reward_fn=reward_fn,
             clean_response_fn=task.clean_response,
-            minibatch_size_train=optimizer_cfg.minibatch_size_train,
-            minibatch_size_eval=optimizer_cfg.minibatch_size_eval,
-            post_instruction=config['post_instruction'],
+            minibatch_size_train=config._cfg.optimizer.minibatch_size_train,
+            minibatch_size_eval=config._cfg.optimizer.minibatch_size_eval,
+            post_instruction=dataset_config['post_instruction'],
         )
     else:
         world_model = PromptOptimizationWorldModel(
@@ -623,52 +599,48 @@ async def evaluate_dataset(
             llm=llm,
             reward_fn=reward_fn,
             clean_response_fn=task.clean_response,
-            minibatch_size_train=optimizer_cfg.minibatch_size_train,
-            minibatch_size_eval=optimizer_cfg.minibatch_size_eval,
-            post_instruction=config['post_instruction'],
+            minibatch_size_train=config._cfg.optimizer.minibatch_size_train,
+            minibatch_size_eval=config._cfg.optimizer.minibatch_size_eval,
+            post_instruction=dataset_config['post_instruction'],
         )
-
-    import feedback_prompt_learning
-    feedback_prompt_learning.cfg.optimizer = optimizer_cfg
 
     logger.info("\n" + "="*80)
     logger.info("OPTIMIZER CONFIGURATION")
     logger.info("="*80)
     logger.info(f"Method: {method.upper()}")
-    logger.info(f"Config file: optimizer/{optimizer_config}.yaml")
-    logger.info(f"Iterations: {optimizer_cfg.num_iterations}")
-    logger.info(f"Max depth: {optimizer_cfg.max_depth}")
-    logger.info(f"Expand width: {optimizer_cfg.expand_width}")
-    logger.info(f"Minibatch train: {optimizer_cfg.minibatch_size_train}")
-    logger.info(f"Minibatch eval: {optimizer_cfg.minibatch_size_eval}")
+    logger.info(f"Iterations: {config._cfg.optimizer.num_iterations}")
+    logger.info(f"Max depth: {config._cfg.optimizer.max_depth}")
+    logger.info(f"Expand width: {config._cfg.optimizer.expand_width}")
+    logger.info(f"Minibatch train: {config._cfg.optimizer.minibatch_size_train}")
+    logger.info(f"Minibatch eval: {config._cfg.optimizer.minibatch_size_eval}")
 
     logger.info("\n" + "-"*80)
     logger.info("GRADIENT ANALYSIS PROMPT:")
     logger.info("-"*80)
-    logger.info(optimizer_cfg.gradient_analysis_prompt)
+    logger.info(config._cfg.optimizer.search_algo.gradient_analysis_prompt)
 
     logger.info("\n" + "-"*80)
     logger.info("PROMPT GENERATION PROMPT:")
     logger.info("-"*80)
-    logger.info(optimizer_cfg.prompt_generation_prompt)
+    logger.info(config._cfg.optimizer.search_algo.prompt_generation_prompt)
     logger.info("="*80 + "\n")
 
     optimizer = MCTSPromptOptimizerFeedback(
-        initial_prompt=config['init_prompt'],
+        initial_prompt=dataset_config['init_prompt'],
         world_model=world_model,
     )
 
     logger.info("="*80)
     logger.info("EVALUATING INITIAL PROMPT ON TEST SET")
     logger.info("="*80)
-    logger.info(f"Initial prompt: {config['init_prompt']}\n")
+    logger.info(f"Initial prompt: {dataset_config['init_prompt']}\n")
 
     init_accuracy, _, _ = await evaluate_on_test_set(
-        config['init_prompt'],
+        dataset_config['init_prompt'],
         test_data,
         llm,
         task.clean_response,
-        config['post_instruction'],
+        dataset_config['post_instruction'],
         desc="Initial eval"
     )
 
@@ -695,7 +667,7 @@ async def evaluate_dataset(
             eval_data,
             llm,
             task.clean_response,
-            config['post_instruction'],
+            dataset_config['post_instruction'],
             desc=f"Node {node_idx}"
         )
 
@@ -729,7 +701,7 @@ async def evaluate_dataset(
         test_data,
         llm,
         task.clean_response,
-        config['post_instruction'],
+        dataset_config['post_instruction'],
         desc="Final test"
     )
 
@@ -737,7 +709,7 @@ async def evaluate_dataset(
     logger.info("FINAL RESULTS")
     logger.info("="*80)
     logger.info(f"Method: {method.upper()}")
-    logger.info(f"Dataset: {config['name']}")
+    logger.info(f"Dataset: {dataset_config['name']}")
     logger.info(f"Initial Test Accuracy: {init_accuracy:.4f}")
     logger.info(f"Final Test Accuracy: {final_accuracy:.4f}")
     logger.info(f"Improvement: {final_accuracy - init_accuracy:+.4f}")
@@ -771,12 +743,6 @@ if __name__ == "__main__":
         help="Optimization method (default: feedback)"
     )
     parser.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="Path to datasets.yaml config file (optional)"
-    )
-    parser.add_argument(
         "--reward_type",
         type=str,
         default="general",
@@ -800,6 +766,5 @@ if __name__ == "__main__":
     asyncio.run(evaluate_dataset(
         dataset_name=args.dataset,
         method=args.method,
-        config_path=args.config,
         reward_type=args.reward_type,
     ))
