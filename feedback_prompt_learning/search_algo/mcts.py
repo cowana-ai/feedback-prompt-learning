@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from os import access
 from typing import Optional
 
 import numpy as np
@@ -118,7 +119,12 @@ class MCTSPromptOptimizerFeedback:
         num_samples: int = config._cfg.optimizer.num_samples,   # Number of prompts generated per gradient
         log_freq: int = 2,
     ):
+        # MEMO:
+        # hydra_instantiate() and config._cfg access in default arguments are evaluated once at module import time, not at each function call. This causes two problems:
 
+        # If config hasn't loaded yet, this will raise an AttributeError
+        # If config is reloaded later, these defaults won't update
+        # Move the instantiation inside the function body using None sentinel pattern:
         self.initial_prompt = initial_prompt
         self.world_model = world_model
         self.llm_action = llm_action
