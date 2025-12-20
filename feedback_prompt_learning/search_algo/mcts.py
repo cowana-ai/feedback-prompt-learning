@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 from tqdm import tqdm
 
-from feedback_prompt_learning import cfg
+from feedback_prompt_learning import config
 from feedback_prompt_learning.data import EvaluationResult
 from feedback_prompt_learning.search_algo.world_model import WorldModel
 from feedback_prompt_learning.utils.similarity import jaccard_ngram
@@ -24,15 +24,15 @@ logger = logging.getLogger(__name__)
 # Format examples using templates from config
 def format_examples(total: int, examples: list[EvaluationResult], include_feedback: bool) -> str:
     """Format evaluation results for display in prompts"""
-    header = cfg.optimizer.example_format.header.format(
+    header = config._cfg.optimizer.example_format.header.format(
         total=total,
         shown=len(examples)
     )
 
     # Check if any example has feedback
     has_any_feedback = include_feedback and any(ex.feedback is not None for ex in examples)
-    template = (cfg.optimizer.example_format.with_feedback if has_any_feedback
-                else cfg.optimizer.example_format.without_feedback)
+    template = (config._cfg.optimizer.example_format.with_feedback if has_any_feedback
+                else config._cfg.optimizer.example_format.without_feedback)
 
     examples_text = header
     last_prompt_feedback = None
@@ -109,13 +109,13 @@ class MCTSPromptOptimizerFeedback:
         self,
         initial_prompt: str,
         world_model: WorldModel,
-        llm_action: ChatOpenAI = hydra_instantiate(cfg.optimizer.llm.action),
-        llm_critic: ChatOpenAI = hydra_instantiate(cfg.optimizer.llm.critic),
-        num_iterations: int = cfg.optimizer.num_iterations,
-        exploration_constant: float = cfg.optimizer.exploration_constant,
-        max_depth: int = cfg.optimizer.max_depth,
-        expand_width: int = cfg.optimizer.expand_width,  # Number of gradient analyses per expansion
-        num_samples: int = cfg.optimizer.num_samples,   # Number of prompts generated per gradient
+        llm_action: ChatOpenAI = hydra_instantiate(config._cfg.optimizer.llm.action),
+        llm_critic: ChatOpenAI = hydra_instantiate(config._cfg.optimizer.llm.critic),
+        num_iterations: int = config._cfg.optimizer.num_iterations,
+        exploration_constant: float = config._cfg.optimizer.exploration_constant,
+        max_depth: int = config._cfg.optimizer.max_depth,
+        expand_width: int = config._cfg.optimizer.expand_width,  # Number of gradient analyses per expansion
+        num_samples: int = config._cfg.optimizer.num_samples,   # Number of prompts generated per gradient
         log_freq: int = 2,
     ):
 
@@ -414,14 +414,14 @@ class MCTSPromptOptimizerFeedback:
         example_string_without_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=False)
 
         # Gradient analysis prompt (descend - focus on errors)
-        gradient_prompt = cfg.optimizer.gradient_analysis_prompt.format(
+        gradient_prompt = config._cfg.optimizer.search_algo.gradient_analysis_prompt.format(
             prompt=prompt,
             example_string_with_feedback=example_string_with_feedback,
             avg_score=avg_score
         ).strip()
 
         # Log which prompt template is being used (first 150 chars to verify config)
-        logger.debug(f"[MCTS Runtime] Using gradient analysis prompt template: {cfg.optimizer.gradient_analysis_prompt[:150]}...")
+        logger.debug(f"[MCTS Runtime] Using gradient analysis prompt template: {config._cfg.optimizer.search_algo.gradient_analysis_prompt[:150]}...")
 
         response = await self.llm_action.ainvoke([HumanMessage(content=gradient_prompt)])
         return response.content.strip(), example_string_without_feedback
@@ -441,7 +441,7 @@ class MCTSPromptOptimizerFeedback:
         for i, traj_prompt in enumerate(trajectory_prompts):
             trajectory_text += f"\n{i+1}. {traj_prompt}\n"
 
-        optimize_prompt = cfg.optimizer.prompt_generation_prompt.format(
+        optimize_prompt = config._cfg.optimizer.search_algo.prompt_generation_prompt.format(
             current_prompt=current_prompt,
             example_string=example_string,
             gradient=gradient,
@@ -452,7 +452,7 @@ class MCTSPromptOptimizerFeedback:
         ).strip()
 
         # Log which prompt template is being used (first 150 chars to verify config)
-        logger.debug(f"[MCTS Runtime] Using prompt generation template: {cfg.optimizer.prompt_generation_prompt[:150]}...")
+        logger.debug(f"[MCTS Runtime] Using prompt generation template: {config._cfg.optimizer.search_algo.prompt_generation_prompt[:150]}...")
 
         response = await self.llm_critic.ainvoke([HumanMessage(content=optimize_prompt)])
         improved_prompts_text = response.content.strip()
