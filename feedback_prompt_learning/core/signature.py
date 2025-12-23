@@ -2,13 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-
-# ============================================================================
-# SIGNATURE SYSTEM (DSPy-inspired but extended)
-# ============================================================================
 
 
 class FieldType(str, Enum):
