@@ -21,6 +21,8 @@ from nltk.corpus import stopwords
 from tqdm import tqdm
 
 from feedback_prompt_learning import config
+from feedback_prompt_learning.core import (Example, ExampleSet, FieldType,
+                                           Signature, SignatureField)
 from feedback_prompt_learning.data import Feedback, RewardOutput
 from feedback_prompt_learning.data.task.bigbench import CustomTask
 from feedback_prompt_learning.search_algo.mcts import \
@@ -188,17 +190,20 @@ def embed_units(units: list[str]) -> list[np.ndarray]:
 # DATA PREPARATION
 # ============================================================================
 
-def create_dataset(task: CustomTask) -> tuple[list[tuple[str, str]], list[tuple[str, str]], list[tuple[str, str]]]:
-    """Convert CustomTask dataset to (input, target) format."""
-    def format_examples(dataset):
-        formatted = []
+def create_dataset(task: CustomTask) -> tuple[ExampleSet, ExampleSet, ExampleSet]:
+    """Convert CustomTask dataset to ExampleSet format."""
+    def format_examples(dataset, name: str):
+        examples = []
         for example in dataset:
-            formatted.append((example['question'], example['answer']))
-        return formatted
+            examples.append(Example(
+                inputs={"question": example['question']},
+                outputs={"answer": example['answer']}
+            ))
+        return ExampleSet(examples=examples, name=name)
 
-    train_data = format_examples(task.dataset["train"])
-    eval_data = format_examples(task.dataset["eval"])
-    test_data = format_examples(task.dataset["test"]) if "test" in task.dataset else []
+    train_data = format_examples(task.dataset["train"], "train")
+    eval_data = format_examples(task.dataset["eval"], "eval")
+    test_data = format_examples(task.dataset["test"], "test") if "test" in task.dataset else ExampleSet(examples=[], name="test")
 
     return train_data, eval_data, test_data
 
@@ -208,14 +213,15 @@ def create_dataset(task: CustomTask) -> tuple[list[tuple[str, str]], list[tuple[
 # ============================================================================
 
 def create_reward_function(
-    train_data: list[tuple[str, str]],
+    train_data: ExampleSet,
     use_feedback: bool = True,
     reward_type: str = "general"
 ) -> Any:
     """
     Create reward function for the task.
     """
-    unique_targets = {target.strip().upper() for _, target in train_data}
+    print(train_data)
+    unique_targets = {example.outputs["answer"].upper() for example in train_data.examples}
     reasoning_memo = defaultdict(list)
     reasoning_basis = defaultdict(list)
 
@@ -487,7 +493,8 @@ def calculate_accuracy(preds: list[str], labels: list[str]) -> float:
 
 async def evaluate_on_test_set(
     prompt: str,
-    test_data: list[tuple[str, str]],
+    world_model: Any,
+    test_data: ExampleSet,
     llm: Any,
     clean_response_fn: Any,
     post_instruction: bool,
@@ -497,7 +504,11 @@ async def evaluate_on_test_set(
     test_messages = []
     test_labels = []
 
-    for input_text, target in test_data:
+    for example in test_data.examples:
+        # Format input text
+        input_text = world_model.prepare_input(example)
+        target = world_model.prepare_output(example)
+
         if post_instruction:
             full_prompt = f"{input_text}\n{prompt}"
         else:
@@ -625,9 +636,18 @@ async def evaluate_dataset(
     logger.info(config._cfg.optimizer.search_algo.prompt_generation_prompt)
     logger.info("="*80 + "\n")
 
+    # Create signature for the task
+    signature = Signature(
+        name=dataset_config['name'],
+        inputs=[SignatureField("input", "The input question or text", FieldType.INPUT)],
+        outputs=[SignatureField("target", "The expected answer or output", FieldType.OUTPUT)],
+        instructions=f"Task: {dataset_config['description']}"
+    )
+
     optimizer = MCTSPromptOptimizerFeedback(
         initial_prompt=dataset_config['init_prompt'],
         world_model=world_model,
+        signature=signature,
     )
 
     logger.info("="*80)
@@ -637,6 +657,7 @@ async def evaluate_dataset(
 
     init_accuracy, _, _ = await evaluate_on_test_set(
         dataset_config['init_prompt'],
+        world_model,
         test_data,
         llm,
         task.clean_response,
@@ -663,7 +684,8 @@ async def evaluate_dataset(
     eval_results = []
     for node_idx, node in enumerate(best_q_path):
         eval_acc, _, _ = await evaluate_on_test_set(
-            node.prompt,
+            node.prompt_version.prompt_text,
+            world_model,
             eval_data,
             llm,
             task.clean_response,
@@ -690,14 +712,15 @@ async def evaluate_dataset(
     logger.info(f"Node Index: {best_result['node_idx']}")
     logger.info(f"Eval Accuracy: {best_result['eval_accuracy']:.4f}")
     logger.info(f"Training Q: {best_result['train_q']:.4f}")
-    logger.info(f"\nPrompt:\n{best_node.prompt}\n")
+    logger.info(f"\nPrompt:\n{best_node.prompt_version.prompt_text}\n")
 
     logger.info("="*80)
     logger.info("FINAL TEST SET EVALUATION")
     logger.info("="*80)
 
     final_accuracy, _, _ = await evaluate_on_test_set(
-        best_node.prompt,
+        best_node.prompt_version.prompt_text,
+        world_model,
         test_data,
         llm,
         task.clean_response,
@@ -713,7 +736,7 @@ async def evaluate_dataset(
     logger.info(f"Initial Test Accuracy: {init_accuracy:.4f}")
     logger.info(f"Final Test Accuracy: {final_accuracy:.4f}")
     logger.info(f"Improvement: {final_accuracy - init_accuracy:+.4f}")
-    logger.info(f"\nBest Prompt:\n{best_node.prompt}")
+    logger.info(f"\nBest Prompt:\n{best_node.prompt_version.prompt_text}")
     logger.info("="*80)
 
     return optimizer, best_node, config, {
