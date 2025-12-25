@@ -64,29 +64,3 @@ class Signature(BaseModel):
         input_names = ", ".join(f.name for f in self.inputs)
         output_names = ", ".join(f.name for f in self.outputs)
         return f"{self.name}: {input_names} → {output_names}"
-
-
-if __name__ == "__main__":
-    # Example usage
-    sig = Signature(
-        name="QA_with_Reasoning",
-        inputs=[
-            SignatureField("question", "A question to answer", FieldType.INPUT)
-        ],
-        outputs=[
-            SignatureField("reasoning", "Step-by-step reasoning", FieldType.INTERMEDIATE),
-            SignatureField("answer", "The final answer", FieldType.OUTPUT)
-        ],
-        instructions="Answer the question with detailed reasoning."
-    )
-    print(sig)
-    target: str = "42"
-    print("Inputs:")
-    for inp in sig.inputs:
-        print(f"  {inp}")
-    print("Outputs:")
-    for out in sig.outputs:
-        print(f"  {out}")
-    print("Instructions:")
-    print(f"  {sig.instructions}")
-    target: str = "42"
