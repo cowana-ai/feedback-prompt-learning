@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -14,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from tqdm import tqdm
 
 from feedback_prompt_learning import config
+from feedback_prompt_learning.core import PromptVersion, Signature
 from feedback_prompt_learning.data import EvaluationResult
 from feedback_prompt_learning.search_algo.world_model import WorldModel
 from feedback_prompt_learning.utils.similarity import jaccard_ngram
@@ -63,7 +65,7 @@ def format_examples(total: int, examples: list[EvaluationResult], include_feedba
 @dataclass
 class MCTSNode:
     """Node in MCTS tree for prompt optimization"""
-    prompt: str
+    prompt_version: PromptVersion
     parent: Optional['MCTSNode'] = None
     children: list['MCTSNode'] = field(default_factory=list)
     cum_rewards: list[float] = field(default_factory=list)
@@ -72,6 +74,11 @@ class MCTSNode:
     _is_terminal: bool = False
     # Track all evaluations for better error analysis
     all_evaluations: list[EvaluationResult] = field(default_factory=list)  # Stores evaluation results with structured feedback
+
+    @property
+    def prompt(self) -> str:
+        """Convenience property for backward compatibility"""
+        return self.prompt_version.prompt_text
 
     @property
     def N(self) -> int:
@@ -109,6 +116,7 @@ class MCTSPromptOptimizerFeedback:
         self,
         initial_prompt: str,
         world_model: WorldModel,
+        signature: Signature,
         llm_action: ChatOpenAI = hydra_instantiate(config._cfg.optimizer.llm.action),
         llm_critic: ChatOpenAI = hydra_instantiate(config._cfg.optimizer.llm.critic),
         num_iterations: int = config._cfg.optimizer.num_iterations,
@@ -126,6 +134,7 @@ class MCTSPromptOptimizerFeedback:
         # Move the instantiation inside the function body using None sentinel pattern:
         self.initial_prompt = initial_prompt
         self.world_model = world_model
+        self.signature = signature
         self.llm_action = llm_action
         self.llm_critic = llm_critic
         self.num_iterations = num_iterations
@@ -134,7 +143,15 @@ class MCTSPromptOptimizerFeedback:
         self.expand_width = expand_width
         self.num_samples = num_samples
         self.log_freq = log_freq
-        self.root = MCTSNode(prompt=initial_prompt)
+
+        # Create initial PromptVersion
+        initial_version = PromptVersion(
+            prompt_text=initial_prompt,
+            signature=signature,
+            version=0,
+            creation_method="initial"
+        )
+        self.root = MCTSNode(prompt_version=initial_version)
 
         # Threshold tracking for early stopping
         self.mcts_threshold = 0.0
@@ -326,9 +343,18 @@ class MCTSPromptOptimizerFeedback:
 
         # Create child nodes with eval results
         all_children = []
-        for new_prompt, (reward, eval_evaluations) in zip(all_new_prompts, eval_results):
+        for i, (new_prompt, (reward, eval_evaluations)) in enumerate(zip(all_new_prompts, eval_results)):
+            # Create new PromptVersion
+            child_version = PromptVersion(
+                prompt_text=new_prompt,
+                signature=self.signature,
+                version=node.prompt_version.version * 100 + i + 1,
+                parent_version=node.prompt_version.version,
+                creation_method="mcts_expansion",
+                improvement_note=f"Generated from gradient analysis at depth {node.depth}"
+            )
             child = MCTSNode(
-                prompt=new_prompt,
+                prompt_version=child_version,
                 parent=node,
                 reward=reward  # Reward from eval batch (unbiased)
             )
@@ -599,8 +625,8 @@ class MCTSPromptOptimizerFeedback:
 
         return results
 
-    def prepare_output(self) -> dict:
-        """Prepare comprehensive output matching original MCTS format"""
+    def prepare_output(self):
+        """Prepare comprehensive output as PromptTrajectory with detailed analysis"""
         self.logger.info("\n" + "="*80)
         self.logger.info("PREPARING OUTPUT - ANALYZING ALL PATHS")
         self.logger.info("="*80)

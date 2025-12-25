@@ -11,6 +11,7 @@ import numpy as np
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
+from feedback_prompt_learning.core import Example, ExampleSet
 from feedback_prompt_learning.data import EvaluationResult, RewardOutput
 
 
@@ -39,7 +40,7 @@ class WorldModel(ABC):
         pass
 
     @abstractmethod
-    def get_batch(self, batch_type: str = 'train') -> list[tuple[str, str]]:
+    def get_batch(self, batch_type: str = 'train') -> ExampleSet:
         """
         Get next batch of data.
 
@@ -47,12 +48,12 @@ class WorldModel(ABC):
             batch_type: 'train' or 'eval'
 
         Returns:
-            List of (input, target) tuples
+            ExampleSet batch
         """
         pass
 
     @abstractmethod
-    def get_fixed_eval_batch(self, depth: int) -> list[tuple[str, str]]:
+    def get_fixed_eval_batch(self, depth: int) -> ExampleSet:
         """
         Get a fixed evaluation batch for a given depth.
         All nodes at same depth should use the same batch for fair comparison.
@@ -111,8 +112,8 @@ class PromptOptimizationWorldModel(WorldModel):
 
     def __init__(
         self,
-        train_dataset: list[tuple[str, str]],
-        eval_dataset: list[tuple[str, str]],
+        train_dataset: ExampleSet,
+        eval_dataset: ExampleSet,
         llm: ChatOpenAI,
         reward_fn: Callable[[str, str, str], tuple[float, str]],
         clean_response_fn: Callable[[str], str],
@@ -124,8 +125,8 @@ class PromptOptimizationWorldModel(WorldModel):
         Initialize the world model.
 
         Args:
-            train_dataset: Training data as (input, target) pairs
-            eval_dataset: Evaluation data as (input, target) pairs
+            train_dataset: Training ExampleSet
+            eval_dataset: Evaluation ExampleSet
             llm: Language model for evaluation
             reward_fn: Function to calculate reward (output, target, prompt) -> (score, feedback)
             clean_response_fn: Function to clean LLM responses
@@ -143,8 +144,8 @@ class PromptOptimizationWorldModel(WorldModel):
         self.post_instruction = post_instruction
 
         # Initialize batching
-        self.train_dataset_copy = list(train_dataset)
-        self.eval_dataset_copy = list(eval_dataset)
+        self.train_dataset_copy = ExampleSet(examples=list(train_dataset.examples), name="train_copy")
+        self.eval_dataset_copy = ExampleSet(examples=list(eval_dataset.examples), name="eval_copy")
         self.current_batch_idx = 0
         self.current_eval_batch_idx = 0
 
@@ -153,13 +154,13 @@ class PromptOptimizationWorldModel(WorldModel):
         self._create_batches('eval')
 
         # Cache for depth-based eval batches
-        self.depth_eval_batches: dict[int, list[tuple[str, str]]] = {}
+        self.depth_eval_batches: dict[int, ExampleSet] = {}
 
     def _create_batches(self, dataset_type: str = 'train'):
         """Create batches from dataset"""
         if dataset_type == 'train':
             dataset_copy = self.train_dataset_copy
-            random.shuffle(dataset_copy)
+            random.shuffle(dataset_copy.examples)
             dataset_len = len(dataset_copy)
             batch_size = self.minibatch_size_train
             num_batches = max(1, dataset_len // batch_size)
@@ -168,19 +169,20 @@ class PromptOptimizationWorldModel(WorldModel):
             for i in range(num_batches):
                 start_idx = i * batch_size
                 end_idx = min(start_idx + batch_size, dataset_len)
-                batches.append(dataset_copy[start_idx:end_idx])
+                batch_examples = dataset_copy.examples[start_idx:end_idx]
+                batches.append(ExampleSet(examples=batch_examples, name=f"train_batch_{i}"))
 
             self.num_batches = num_batches
             self.batches = batches
 
         elif dataset_type == 'eval':
-            if not self.eval_dataset_copy:
+            if not self.eval_dataset_copy.examples:
                 self.num_eval_batches = 0
                 self.eval_batches = []
                 return
 
             dataset_copy = self.eval_dataset_copy
-            random.shuffle(dataset_copy)
+            random.shuffle(dataset_copy.examples)
             dataset_len = len(dataset_copy)
             batch_size = self.minibatch_size_eval
             num_batches = max(1, dataset_len // batch_size)
@@ -189,37 +191,38 @@ class PromptOptimizationWorldModel(WorldModel):
             for i in range(num_batches):
                 start_idx = i * batch_size
                 end_idx = min(start_idx + batch_size, dataset_len)
-                batches.append(dataset_copy[start_idx:end_idx])
+                batch_examples = dataset_copy.examples[start_idx:end_idx]
+                batches.append(ExampleSet(examples=batch_examples, name=f"eval_batch_{i}"))
 
             self.num_eval_batches = num_batches
             self.eval_batches = batches
 
-    def get_batch(self, batch_type: str = 'train') -> list[tuple[str, str]]:
+    def get_batch(self, batch_type: str = 'train') -> ExampleSet:
         """Get next batch of data"""
         if batch_type == 'train':
             if not self.batches:
-                return []
+                return ExampleSet(examples=[], name="empty_train_batch")
 
             batch = self.batches[self.current_batch_idx]
             self.current_batch_idx = (self.current_batch_idx + 1) % self.num_batches
 
             # Reshuffle when we complete an epoch
             if self.current_batch_idx == 0:
-                random.shuffle(self.train_dataset_copy)
+                random.shuffle(self.train_dataset_copy.examples)
                 self._create_batches('train')
 
             return batch
 
         elif batch_type == 'eval':
             if not self.eval_batches:
-                return []
+                return ExampleSet(examples=[], name="empty_eval_batch")
 
             batch = self.eval_batches[self.current_eval_batch_idx]
             self.current_eval_batch_idx = (self.current_eval_batch_idx + 1) % self.num_eval_batches
 
             # Reshuffle when we complete an epoch
             if self.current_eval_batch_idx == 0:
-                random.shuffle(self.eval_dataset_copy)
+                random.shuffle(self.eval_dataset_copy.examples)
                 self._create_batches('eval')
 
             return batch
@@ -227,22 +230,58 @@ class PromptOptimizationWorldModel(WorldModel):
         else:
             raise ValueError(f"Unknown batch_type: {batch_type}")
 
-    def get_fixed_eval_batch(self, depth: int) -> list[tuple[str, str]]:
+    def get_fixed_eval_batch(self, depth: int) -> ExampleSet:
         """Get a fixed evaluation batch for a given depth."""
         # TODO: Implement depth-based batch selection if needed
-        return self.eval_dataset # Always return full eval dataset
+        return ExampleSet(examples=list(self.eval_dataset.examples), name=f"fixed_eval_depth_{depth}")  # Always return full eval dataset
 
-    def build_prompts(self, inputs: list[str], prompt: str) -> list[str]:
-        """Build full prompts by combining inputs with instruction prompt"""
-        if self.post_instruction:
-            return [f'{input_text}\n{prompt}' for input_text in inputs]
+    def prepare_input(self, example: Example) -> str:
+        """Prepare input text from a single example"""
+        if len(example.inputs) == 1:
+            # Single input field
+            return str(list(example.inputs.values())[0]).strip()
         else:
-            return [f'{prompt}\n{input_text}' for input_text in inputs]
+            # Multiple input fields - format as key: value pairs
+            parts = []
+            for key, value in example.inputs.items():
+                parts.append(f"{key}: {value}")
+            return "\n".join(parts
+                             ).strip()
+    def prepare_inputs(self, examples: list[Example]) -> list[str]:
+        """Prepare input texts from examples"""
+        input_texts = []
+        for example in examples:
+            input_text = self.prepare_input(example)
+            input_texts.append(input_text)
+        return input_texts
+
+    def prepare_output(self, example: Example) -> str:
+        """Prepare target text from a single example"""
+        if len(example.outputs) == 1:
+            return str(list(example.outputs.values())[0]).strip()
+        else:
+            return "\n".join(f"{k}: {v}" for k, v in example.outputs.items()).strip()
+
+    def prepare_outputs(self, examples: list[Example]) -> list[str]:
+        """Prepare target texts from examples"""
+        target_texts = []
+        for example in examples:
+            target_text = self.prepare_output(example)
+            target_texts.append(target_text)
+        return target_texts
+
+    def build_prompts(self, examples: list[Example], prompt: str) -> list[str]:
+        """Build full prompts by combining inputs with instruction prompt"""
+        input_texts = self.prepare_inputs(examples)
+        if self.post_instruction:
+            return [f'{input_text}\n{prompt}' for input_text in input_texts]
+        else:
+            return [f'{prompt}\n{input_text}' for input_text in input_texts]
 
     async def evaluate_prompt(
         self,
         prompt: str,
-        dataset: list[tuple[str, str]],
+        dataset: ExampleSet,
         eval: bool = False
     ) -> tuple[float, list[EvaluationResult]]:
         """
@@ -256,18 +295,21 @@ class PromptOptimizationWorldModel(WorldModel):
 
         # Process in batches to avoid overwhelming API
         batch_size = self.minibatch_size_eval
-        for i in range(0, len(dataset), batch_size):
-            batch = dataset[i:i + batch_size]
-            inputs = [input_text for input_text, _ in batch]
-            full_prompts = self.build_prompts(inputs, prompt)
+        examples = dataset.examples
+        for i in range(0, len(examples), batch_size):
+            batch_examples = examples[i:i + batch_size]
+            full_prompts = self.build_prompts(batch_examples, prompt)
             messages_batch = [[HumanMessage(content=p)] for p in full_prompts]
 
             # Batch LLM inference
             responses = await self.llm.abatch(messages_batch)
 
             # Calculate scores and collect feedback
-            for response, (input_text, target) in zip(responses, batch):
+            for response, example in zip(responses, batch_examples):
                 raw_output = response.content
+                input_text = self.prepare_input(example)
+                target = self.prepare_output(example)
+
                 reward_output = self.calculate_reward(raw_output, target, prompt, input_text if not eval else "")
                 scores.append(reward_output.score)
 
@@ -287,7 +329,7 @@ class PromptOptimizationWorldModel(WorldModel):
     async def evaluate_prompt_with_feedback(
         self,
         prompt: str,
-        batch: list[tuple[str, str]]
+        batch: ExampleSet
     ) -> list[EvaluationResult]:
         """Evaluate prompt and return detailed feedback (without average)"""
         _, evaluations = await self.evaluate_prompt(prompt, batch)
@@ -323,14 +365,14 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
     Uses random sampling from all evaluations.
     """
     def get_fixed_eval_batch(self, depth):
-        return self.eval_dataset  # Always return full dataset
+        return ExampleSet(examples=list(self.eval_dataset.examples), name=f"fixed_eval_depth_{depth}")  # Always return full dataset
 
     async def evaluate_prompt(
         self,
         prompt: str,
-        dataset: list[tuple[str, str]],
+        dataset: ExampleSet,
         eval: bool = False
-    ) -> tuple[float, list[dict]]:
+    ) -> tuple[float, list[EvaluationResult]]:
         """
         Evaluate a prompt on the entire dataset with batched inference.
         Processes dataset in chunks to avoid overwhelming the LLM API.
@@ -347,18 +389,21 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
 
         # Process in batches to avoid overwhelming API
         batch_size = self.minibatch_size_eval
-        for i in range(0, len(dataset), batch_size):
-            batch = dataset[i:i + batch_size]
-            inputs = [input_text for input_text, _ in batch]
-            full_prompts = self.build_prompts(inputs, prompt)
+        examples = dataset.examples
+        for i in range(0, len(examples), batch_size):
+            batch_examples = examples[i:i + batch_size]
+            full_prompts = self.build_prompts(batch_examples, prompt)
             messages_batch = [[HumanMessage(content=p)] for p in full_prompts]
 
             # Batch LLM inference
             responses = await self.llm.abatch(messages_batch)
 
             # Calculate scores and collect feedback
-            for response, (input_text, target) in zip(responses, batch):
+            for response, example in zip(responses, batch_examples):
                 raw_output = response.content
+                input_text = self.prepare_input(example)
+                target = self.prepare_output(example)
+
                 reward_output = self.calculate_reward(raw_output, target, prompt, input_text if not eval else "")
                 scores.append(reward_output.score)
                 evaluation = EvaluationResult(
@@ -376,19 +421,21 @@ class PromptAgentWorldModel(PromptOptimizationWorldModel):
 
     def sample_examples(
         self,
-        all_evaluations: list[dict],
+        all_evaluations: list[EvaluationResult],
         num_examples: int = 5,
-    ) -> list[dict]:
+    ) -> list[EvaluationResult]:
         if not all_evaluations:
             return []
         batch_evals = all_evaluations[-num_examples:]
 
         return batch_evals #[ev for ev in batch_evals if ev['score'] == 0]
 
-    def build_prompts(self, inputs: list[str], prompt: str) -> list[str]:
+    def build_prompts(self, examples: list[Example], prompt: str) -> list[str]:
         """Build full prompts by combining inputs with instruction prompt"""
+        input_texts = self.prepare_inputs(examples)
+
         output_format = "At the end show the answer option bracketed between <answer> and </answer>."
         if self.post_instruction:
-            return [f'{input_text}\n{prompt}\n{output_format}' for input_text in inputs]
+            return [f'{input_text}\n{prompt}\n{output_format}' for input_text in input_texts]
         else:
-            return [f'{prompt}\n{input_text}\n{output_format}' for input_text in inputs]
+            return [f'{prompt}\n{input_text}\n{output_format}' for input_text in input_texts]
