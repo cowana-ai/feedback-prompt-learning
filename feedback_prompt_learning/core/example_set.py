@@ -518,6 +518,44 @@ class ExampleSet(BaseModel):
         ]
 
     @classmethod
+    def from_tuples(
+        cls,
+        tuples: list[tuple[str, str]],
+        input_key: str = "input",
+        output_key: str = "target",
+        name: str = "dataset",
+        signature: Signature | None = None
+    ) -> ExampleSet:
+        """
+        Create ExampleSet from list of (input, target) tuples (legacy format).
+
+        Args:
+            tuples: List of (input_text, target_text) tuples
+            input_key: Key to use for input field
+            output_key: Key to use for output field
+            name: Dataset name
+            signature: Optional signature
+
+        Returns:
+            New ExampleSet
+        """
+        examples = [Example.from_tuple(t, input_key, output_key) for t in tuples]
+        return cls(examples=examples, name=name, signature=signature)
+
+    def to_tuples(self, input_key: str = "input", output_key: str = "target") -> list[tuple[str, str]]:
+        """
+        Convert to list of (input, target) tuples for backward compatibility.
+
+        Args:
+            input_key: Key of input field to use
+            output_key: Key of output field to use
+
+        Returns:
+            List of (input_text, target_text) tuples
+        """
+        return [ex.to_tuple(input_key, output_key) for ex in self.examples]
+
+    @classmethod
     def from_list(
         cls,
         data: list[dict[str, Any]],

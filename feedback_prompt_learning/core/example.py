@@ -280,6 +280,38 @@ class Example(BaseModel):
         return {"inputs": missing_inputs, "outputs": missing_outputs}
 
     @classmethod
+    def from_tuple(cls, input_target_tuple: tuple[str, str], input_key: str = "input", output_key: str = "target") -> Example:
+        """
+        Create Example from (input, target) tuple format used in legacy code.
+
+        Args:
+            input_target_tuple: Tuple of (input_text, target_text)
+            input_key: Key to use for input field
+            output_key: Key to use for output field
+
+        Returns:
+            Example with input and output fields
+        """
+        input_text, target_text = input_target_tuple
+        return cls(
+            inputs={input_key: input_text},
+            outputs={output_key: target_text}
+        )
+
+    def to_tuple(self, input_key: str = "input", output_key: str = "target") -> tuple[str, str]:
+        """
+        Convert to (input, target) tuple format for backward compatibility.
+
+        Args:
+            input_key: Key of input field to use
+            output_key: Key of output field to use
+
+        Returns:
+            Tuple of (input_text, target_text)
+        """
+        return (self.inputs.get(input_key, ""), self.outputs.get(output_key, ""))
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any], input_keys: list[str] | None = None) -> Example:
         """
         Create from a flat dictionary with optional input key specification.
