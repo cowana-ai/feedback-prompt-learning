@@ -1,11 +1,12 @@
 """
-MCTS Prompt Optimizer with Feedback-Driven Actions
+This module implements Monte Carlo Tree Search (MCTS) for prompt optimization
+with feedback-driven gradient generation.
 """
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -23,15 +24,36 @@ from feedback_prompt_learning.utils.similarity import jaccard_ngram
 logger = logging.getLogger(__name__)
 
 
-# Format examples using templates from config
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+DEFAULT_LOG_FREQUENCY = 2
+MIN_DEPTH_FOR_EARLY_STOP = 2
+PROMPT_EXTRACT_PATTERN = r'<START>\s*(.+?)\s*<END>'
+TOP_K_NODES = 5
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
 def format_examples(total: int, examples: list[EvaluationResult], include_feedback: bool) -> str:
-    """Format evaluation results for display in prompts"""
+    """Format evaluation results for display in prompts.
+
+    Args:
+        total: Total number of examples available
+        examples: List of evaluation results to format
+        include_feedback: Whether to include feedback in the output
+
+    Returns:
+        Formatted string with examples and optional feedback
+    """
     header = config._cfg.optimizer.example_format.header.format(
         total=total,
         shown=len(examples)
     )
 
-    # Check if any example has feedback
     has_any_feedback = include_feedback and any(ex.feedback is not None for ex in examples)
     template = (config._cfg.optimizer.example_format.with_feedback if has_any_feedback
                 else config._cfg.optimizer.example_format.without_feedback)
@@ -50,21 +72,31 @@ def format_examples(total: int, examples: list[EvaluationResult], include_feedba
             accuracy_feedback=feedback.accuracy_feedback if feedback else None,
             reasoning_feedback=feedback.reasoning_feedback if feedback else None,
         )
-        # Track last non-None prompt feedback
         if feedback and feedback.has_prompt_feedback():
             last_prompt_feedback = feedback.prompt_feedback
 
-    # Add overall prompt feedback if available
     if last_prompt_feedback:
         examples_text += f"\nOverall Prompt Feedback: {last_prompt_feedback}\n"
 
-    return examples_text# ============================================================================
-# DATA DEFINITIONS
+    return examples_text
+# ============================================================================
+# MCTS NODE
 # ============================================================================
 
 @dataclass
 class MCTSNode:
-    """Node in MCTS tree for prompt optimization"""
+    """Node in MCTS tree for prompt optimization.
+
+    Attributes:
+        prompt_version: Version of the prompt at this node
+        parent: Parent node in the tree
+        children: List of child nodes
+        cum_rewards: Cumulative rewards from all visits
+        reward: Single evaluation reward for this node
+        visited: Number of times this node has been visited
+        _is_terminal: Whether this node is terminal
+        all_evaluations: All evaluation results with feedback
+    """
     prompt_version: PromptVersion
     parent: Optional['MCTSNode'] = None
     children: list['MCTSNode'] = field(default_factory=list)
@@ -72,8 +104,7 @@ class MCTSNode:
     reward: float = 0.0
     visited: int = 0
     _is_terminal: bool = False
-    # Track all evaluations for better error analysis
-    all_evaluations: list[EvaluationResult] = field(default_factory=list)  # Stores evaluation results with structured feedback
+    all_evaluations: list[EvaluationResult] = field(default_factory=list)
 
     @property
     def prompt(self) -> str:
@@ -110,7 +141,11 @@ class MCTSNode:
 # ============================================================================
 
 class MCTSPromptOptimizerFeedback:
-    """MCTS for Prompt Optimization using LLM-generated actions based on feedback"""
+    """MCTS for Prompt Optimization using LLM-generated actions based on feedback.
+
+    This optimizer uses Monte Carlo Tree Search to explore the space of possible
+    prompts, guided by feedback-driven gradient generation from an LLM.
+    """
 
     def __init__(
         self,
@@ -122,16 +157,10 @@ class MCTSPromptOptimizerFeedback:
         num_iterations: int = config._cfg.optimizer.num_iterations,
         exploration_constant: float = config._cfg.optimizer.exploration_constant,
         max_depth: int = config._cfg.optimizer.max_depth,
-        expand_width: int = config._cfg.optimizer.expand_width,  # Number of gradient analyses per expansion
-        num_samples: int = config._cfg.optimizer.num_samples,   # Number of prompts generated per gradient
-        log_freq: int = 2,
+        expand_width: int = config._cfg.optimizer.expand_width,
+        num_samples: int = config._cfg.optimizer.num_samples,
+        log_freq: int = DEFAULT_LOG_FREQUENCY,
     ):
-        # MEMO:
-        # hydra_instantiate() and config._cfg access in default arguments are evaluated once at module import time, not at each function call. This causes two problems:
-
-        # If config hasn't loaded yet, this will raise an AttributeError
-        # If config is reloaded later, these defaults won't update
-        # Move the instantiation inside the function body using None sentinel pattern:
         self.initial_prompt = initial_prompt
         self.world_model = world_model
         self.signature = signature
@@ -153,47 +182,44 @@ class MCTSPromptOptimizerFeedback:
         )
         self.root = MCTSNode(prompt_version=initial_version)
 
-        # Threshold tracking for early stopping
+        # Early stopping thresholds
         self.mcts_threshold = 0.0
         self.min_threshold = 0.0
-        self.min_depth = 2
+        self.min_depth = MIN_DEPTH_FOR_EARLY_STOP
 
-        # Track all nodes and iteration paths
+        # Tracking
         self.all_nodes = [self.root]
         self.trace_in_each_iter = []
 
-        # Initialize logger
         self.logger = logging.getLogger(__name__)
+        self._log_initialization(world_model)
 
-        # Log dataset info
+    def _log_initialization(self, world_model: WorldModel) -> None:
+        """Log initialization information."""
         dataset_info = world_model.get_dataset_info()
-        self.logger.info(f"Feedback-driven MCTS initialized")
-        self.logger.info(f"Train Dataset: {dataset_info['train_size']} examples, {dataset_info['train_batches']} batches of ~{dataset_info['minibatch_size_train']}")
+        self.logger.info("Feedback-driven MCTS initialized")
+        self.logger.info(
+            f"Train Dataset: {dataset_info['train_size']} examples, "
+            f"{dataset_info['train_batches']} batches of ~{dataset_info['minibatch_size_train']}"
+        )
         if dataset_info['eval_size'] > 0:
-            self.logger.info(f"Eval Dataset: {dataset_info['eval_size']} examples, {dataset_info['eval_batches']} batches of ~{dataset_info['minibatch_size_eval']}")
+            self.logger.info(
+                f"Eval Dataset: {dataset_info['eval_size']} examples, "
+                f"{dataset_info['eval_batches']} batches of ~{dataset_info['minibatch_size_eval']}"
+            )
 
     async def run(self) -> MCTSNode:
-        """Main MCTS algorithm"""
+        """Main MCTS algorithm.
+
+        Returns:
+            Best child node found during search
+        """
         self.logger.info(f"\nStarting MCTS with {self.num_iterations} iterations...")
         self.logger.info(f"Initial prompt: {self.initial_prompt}\n")
 
-        # Initialize root - evaluate on eval batch for unbiased reward
-        # Root is at depth 0, get eval batch for it
-        eval_batch = self.world_model.get_fixed_eval_batch(0)
-        self.root.reward, eval_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, eval_batch, eval=True)
-
-        # Also get train batch for gradient analysis
-        train_batch = self.world_model.get_batch('train')
-        _, train_evaluations = await self.world_model.evaluate_prompt(self.root.prompt, train_batch)
-        self.root.all_evaluations.extend(train_evaluations)
-
+        await self._initialize_root()
 
         self.logger.info(f"Root initial reward: {self.root.reward:.4f}\n")
-
-        # Initialize thresholds
-        if self.min_threshold == 0:
-            self.min_threshold = self.root.reward
-            self.mcts_threshold = self.root.reward
 
         for iteration in tqdm(range(self.num_iterations), desc="MCTS Iterations", ncols=100, file=None, mininterval=0.1):
             # Selection
@@ -223,50 +249,114 @@ class MCTSPromptOptimizerFeedback:
 
         return self._best_child_of(self.root)
 
+    async def _initialize_root(self) -> None:
+        """Initialize root node with evaluation on both train and eval sets."""
+        eval_batch = self.world_model.get_fixed_eval_batch(0)
+        self.root.reward, _ = await self.world_model.evaluate_prompt(
+            self.root.prompt, eval_batch, eval=True
+        )
+
+        train_batch = self.world_model.get_batch('train')
+        _, train_evaluations = await self.world_model.evaluate_prompt(
+            self.root.prompt, train_batch
+        )
+        self.root.all_evaluations.extend(train_evaluations)
+
+        if self.min_threshold == 0:
+            self.min_threshold = self.root.reward
+            self.mcts_threshold = self.root.reward
+
+    # ============================================================================
+    # MCTS CORE OPERATIONS
+    # ============================================================================
+
     def _uct(self, node: MCTSNode) -> float:
-        """Calculate UCT value"""
+        """Calculate Upper Confidence Bound for Trees (UCT) value.
+
+        UCT = Q(node) + c * sqrt(log(N_parent) / N_node)
+
+        Args:
+            node: Node to calculate UCT for
+
+        Returns:
+            UCT value for node selection
+        """
         N_parent = node.parent.N if node.parent else 0
         return node.Q + self.c * np.sqrt(np.log(N_parent + 1) / max(1, node.N))
 
     def _select(self, node: MCTSNode) -> list[MCTSNode]:
-        """Selection phase"""
+        """Selection phase: traverse tree using UCT until reaching a leaf.
+
+        Args:
+            node: Root node to start selection from
+
+        Returns:
+            Path from root to selected leaf node
+        """
         path = []
         while True:
             path.append(node)
             node.visited += 1
 
-            if len(node.children) == 0 or node.is_terminal(self.max_depth):
+            if not node.children or node.is_terminal(self.max_depth):
                 return path
 
             node = max(node.children, key=self._uct)
 
         return path
 
-    def increase_threshold(self, threshold: float):
-        """Update the global max threshold if a better reward is found"""
+    def _backpropagation(self, path: list[MCTSNode]) -> None:
+        """Backpropagation phase: update cumulative rewards along path.
+
+        Args:
+            path: Path of nodes to backpropagate through
+        """
+        rewards = []
+        for node in reversed(path):
+            rewards.append(node.reward)
+            cum_reward = np.sum(rewards[::-1])
+            node.cum_rewards.append(cum_reward)
+
+    # ============================================================================
+    # EARLY STOPPING AND THRESHOLDS
+    # ============================================================================
+
+    def increase_threshold(self, threshold: float) -> None:
+        """Update global max threshold if better reward found."""
         if threshold > self.mcts_threshold:
             self.mcts_threshold = threshold
 
     def early_stop(self, node: MCTSNode) -> bool:
-        """Check if node is good enough to stop simulation early"""
+        """Check if node is good enough to stop simulation early."""
         return node.reward > self.mcts_threshold and node.depth > self.min_depth
 
     def _is_terminal_with_min_threshold(self, node: MCTSNode) -> bool:
-        """Check if node reward is too low to continue exploring"""
+        """Check if node reward is too low to continue exploring."""
         if node.parent is None:
             min_threshold = self.min_threshold
         else:
             min_threshold = (self.min_threshold + node.parent.reward) / 2
         return node.reward < min_threshold and node.depth > self.min_depth
 
+    # ============================================================================
+    # TRAJECTORY AND GRADIENT GENERATION
+    # ============================================================================
+
     def _get_trajectory_prompts(self, node: MCTSNode) -> list[str]:
-        """Collect the trajectory of prompts from root to given node"""
+        """Collect trajectory of prompts from root to given node.
+
+        Args:
+            node: Target node
+
+        Returns:
+            List of prompts from root to node (in order)
+        """
         trajectory_prompts = []
         temp_node = node
         while temp_node is not None:
             trajectory_prompts.append(temp_node.prompt)
             temp_node = temp_node.parent
-        return trajectory_prompts[::-1]  # Reverse to get root -> node order
+        return trajectory_prompts[::-1]
 
 
     async def _generate_gradient_and_prompts(
@@ -275,25 +365,36 @@ class MCTSPromptOptimizerFeedback:
         minibatch: list[tuple[str, str]],
         trajectory_prompts: list[str]
     ) -> list[str]:
-        """Generate gradient analysis and new prompts for one expansion width"""
-        # Evaluate current prompt and collect feedback
-        batch_feedback = await self.world_model.evaluate_prompt_with_feedback(node.prompt, minibatch)
+        """Generate gradient analysis and new prompts for one expansion width.
 
-        # Store evaluations in parent node for tracking
+        Args:
+            node: Current node to expand from
+            minibatch: Batch of training examples
+            trajectory_prompts: Historical prompts from root to node
+
+        Returns:
+            List of newly generated prompts
+        """
+        batch_feedback = await self.world_model.evaluate_prompt_with_feedback(
+            node.prompt, minibatch
+        )
+
         node.all_evaluations.extend(batch_feedback)
-        # TODO: Consider refactoring this
-        newline = '\n'
-        self.logger.debug(f"""Feedback:
-        {''.join([res.feedback.reasoning_feedback + newline for res in batch_feedback if res.feedback and res.feedback.reasoning_feedback])}
-        """)
-        # Ask LLM to analyze errors and generate gradient (improvement direction)
+
+        if self.logger.isEnabledFor(logging.DEBUG):
+            reasoning_feedbacks = [
+                res.feedback.reasoning_feedback
+                for res in batch_feedback
+                if res.feedback and res.feedback.reasoning_feedback
+            ]
+            if reasoning_feedbacks:
+                self.logger.debug(f"Feedback:\n{''.join(f + '\n' for f in reasoning_feedbacks)}")
+
         gradient, sampled_example_string = await self._get_action_decisions(
             node.prompt, node.all_evaluations
         )
         self.logger.debug(f"Generated gradient: {gradient}")
-        assert len(sampled_example_string) > 0, "Example string should not be empty"
 
-        # Generate num_samples prompts from this gradient
         new_prompts = await self._generate_new_prompts(
             node.prompt,
             gradient,
@@ -301,68 +402,49 @@ class MCTSPromptOptimizerFeedback:
             self.num_samples,
             sampled_example_string
         )
-        self.logger.debug(f"Generated new prompts: {new_prompts}")
+        self.logger.debug(f"Generated {len(new_prompts)} new prompts")
         return new_prompts
 
     async def _expand(self, node: MCTSNode) -> list[MCTSNode]:
-        """Expansion phase - generate new prompts using LLM with trajectory context"""
+        """Expansion phase: generate and evaluate new child prompts.
+
+        Parallelizes gradient generation and prompt evaluation for efficiency.
+
+        Args:
+            node: Node to expand
+
+        Returns:
+            List of newly created child nodes
+        """
         if node.is_terminal(self.max_depth):
             return []
 
         expand_start = time.time()
-
-        # Get trajectory from root to current node
         trajectory_prompts = self._get_trajectory_prompts(node)
 
-        # OPTIMIZATION 1: Parallelize gradient generation across expand_width
-        # Each width generates num_samples prompts
-        gradient_tasks = []
-        minibatches = []  # Store minibatches for later use
-        for width_idx in range(self.expand_width):
-            minibatch = self.world_model.get_batch('train')
-            minibatches.append(minibatch)
-            task = self._generate_gradient_and_prompts(node, minibatch, trajectory_prompts)
-            gradient_tasks.append(task)
-
-        # Wait for all gradient analyses to complete in parallel
+        # Parallelize gradient generation across expand_width
+        gradient_tasks = [
+            self._generate_gradient_and_prompts(
+                node,
+                self.world_model.get_batch('train'),
+                trajectory_prompts
+            )
+            for _ in range(self.expand_width)
+        ]
         all_new_prompts_by_width = await asyncio.gather(*gradient_tasks)
+        all_new_prompts = [p for prompts in all_new_prompts_by_width for p in prompts]
 
-        # Flatten the list of lists into a single list of all new prompts
-        all_new_prompts = []
-        for prompts in all_new_prompts_by_width:
-            all_new_prompts.extend(prompts)
-
-        # OPTIMIZATION 2: Parallelize all child evaluations on eval batch
-        # Only evaluate on eval dataset for reward signal (no redundant train evals)
+        # Parallelize child evaluations on eval batch
         child_depth = node.depth + 1
         eval_batch = self.world_model.get_fixed_eval_batch(child_depth)
-
-        # Evaluate all new prompts in parallel
-        eval_tasks = [self.world_model.evaluate_prompt(prompt, eval_batch, eval=True) for prompt in all_new_prompts]
+        eval_tasks = [
+            self.world_model.evaluate_prompt(prompt, eval_batch, eval=True)
+            for prompt in all_new_prompts
+        ]
         eval_results = await asyncio.gather(*eval_tasks)
 
-        # Create child nodes with eval results
-        all_children = []
-        for i, (new_prompt, (reward, eval_evaluations)) in enumerate(zip(all_new_prompts, eval_results)):
-            # Create new PromptVersion
-            child_version = PromptVersion(
-                prompt_text=new_prompt,
-                signature=self.signature,
-                version=node.prompt_version.version * 100 + i + 1,
-                parent_version=node.prompt_version.version,
-                creation_method="mcts_expansion",
-                improvement_note=f"Generated from gradient analysis at depth {node.depth}"
-            )
-            child = MCTSNode(
-                prompt_version=child_version,
-                parent=node,
-                reward=reward  # Reward from eval batch (unbiased)
-            )
-            # Note: We don't store train evaluations here anymore to avoid redundant API calls
-            # Train evaluations will be collected when this node is expanded
-            all_children.append(child)
-            self.all_nodes.append(child)
-
+        # Create child nodes
+        all_children = self._create_child_nodes(node, all_new_prompts, eval_results)
         node.children.extend(all_children)
 
         expand_time = time.time() - expand_start
@@ -370,57 +452,85 @@ class MCTSPromptOptimizerFeedback:
 
         return all_children
 
-    async def _simulate(self, path: list[MCTSNode]):
-        """Simulation phase with early stopping"""
+    def _create_child_nodes(
+        self,
+        parent: MCTSNode,
+        prompts: list[str],
+        eval_results: list[tuple[float, list[EvaluationResult]]]
+    ) -> list[MCTSNode]:
+        """Create child nodes from prompts and evaluation results.
+
+        Args:
+            parent: Parent node
+            prompts: List of new prompts
+            eval_results: Evaluation results for each prompt
+
+        Returns:
+            List of child nodes
+        """
+        children = []
+        for i, (new_prompt, (reward, _)) in enumerate(zip(prompts, eval_results)):
+            child_version = PromptVersion(
+                prompt_text=new_prompt,
+                signature=self.signature,
+                version=parent.prompt_version.version * 100 + i + 1,
+                parent_version=parent.prompt_version.version,
+                creation_method="mcts_expansion",
+                improvement_note=f"Generated from gradient analysis at depth {parent.depth}"
+            )
+            child = MCTSNode(prompt_version=child_version, parent=parent, reward=reward)
+            children.append(child)
+            self.all_nodes.append(child)
+        return children
+
+    async def _simulate(self, path: list[MCTSNode]) -> None:
+        """Simulation phase: continue expanding until terminal condition.
+
+        Uses greedy selection and early stopping for efficiency.
+
+        Args:
+            path: Current path, will be extended during simulation
+        """
         node = path[-1]
 
         while True:
-            # Early stop if we found a very good node
             if self.early_stop(node):
                 node._is_terminal = True
                 self.increase_threshold(node.reward)
                 break
 
-            # Update global threshold
             self.increase_threshold(node.reward)
 
-            # Check if terminal (depth limit or low reward)
             if node.is_terminal(self.max_depth) or self._is_terminal_with_min_threshold(node):
                 break
 
-            # Expand if no children
-            if len(node.children) == 0:
-                await self._expand(node)  # _expand fetches batch internally
+            if not node.children:
+                await self._expand(node)
 
-            # Break if still no children after expansion
-            if len(node.children) == 0:
+            if not node.children:
                 node._is_terminal = True
                 break
 
-            # Greedy selection - choose best child by reward
             node = max(node.children, key=lambda c: c.reward)
             node.visited += 1
             path.append(node)
 
-    def _backpropagation(self, path: list[MCTSNode]):
-        """Backpropagation phase"""
-        rewards = []
-        for node in reversed(path):
-            rewards.append(node.reward)
-            cum_reward = np.sum(rewards[::-1])
-            node.cum_rewards.append(cum_reward)
 
 
+    # ============================================================================
+    # LLM INTERACTION
+    # ============================================================================
 
     async def _get_action_decisions(
         self,
         prompt: str,
         all_evaluations: list[EvaluationResult],
     ) -> tuple[str, str]:
+        """Ask LLM to analyze feedback and generate improvement gradient.
+
+        Returns:
+            Tuple of (gradient, example_string)
         """
-        Ask LLM to analyze feedback and generate improvement gradient.
-        """
-        # TODO: consider adding gradient ascend analysis when average score is high
         return await self._get_descend_gradient(prompt, all_evaluations)
 
     async def _get_descend_gradient(
@@ -428,9 +538,15 @@ class MCTSPromptOptimizerFeedback:
         prompt: str,
         selected_evaluations: list[EvaluationResult]
     ) -> tuple[str, str]:
-        """Analyze errors to generate improvement gradient (original behavior)"""
+        """Analyze errors to generate improvement gradient.
 
-        # Use WorldModel's sampling strategy (delegates to specific implementation)
+        Args:
+            prompt: Current prompt to analyze
+            selected_evaluations: Evaluation results with feedback
+
+        Returns:
+            Tuple of (gradient analysis, example string)
+        """
         dataset_info = self.world_model.get_dataset_info()
         num_examples = dataset_info['minibatch_size_train']
         sampled_examples = self.world_model.sample_examples(
@@ -438,21 +554,29 @@ class MCTSPromptOptimizerFeedback:
             num_examples=num_examples,
         )
 
-        # Calculate average score across all evaluations
-        avg_score = np.mean([result.score for result in selected_evaluations]) if selected_evaluations else 0.0
+        avg_score = np.mean([r.score for r in selected_evaluations]) if selected_evaluations else 0.0
 
-        example_string_with_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=True)
-        example_string_without_feedback = format_examples(total=len(selected_evaluations), examples=sampled_examples, include_feedback=False)
+        example_string_with_feedback = format_examples(
+            total=len(selected_evaluations),
+            examples=sampled_examples,
+            include_feedback=True
+        )
+        example_string_without_feedback = format_examples(
+            total=len(selected_evaluations),
+            examples=sampled_examples,
+            include_feedback=False
+        )
 
-        # Gradient analysis prompt (descend - focus on errors)
         gradient_prompt = config._cfg.optimizer.search_algo.gradient_analysis_prompt.format(
             prompt=prompt,
             example_string_with_feedback=example_string_with_feedback,
             avg_score=avg_score
         ).strip()
 
-        # Log which prompt template is being used (first 150 chars to verify config)
-        logger.debug(f"[MCTS Runtime] Using gradient analysis prompt template: {config._cfg.optimizer.search_algo.gradient_analysis_prompt[:150]}...")
+        logger.debug(
+            f"[MCTS Runtime] Gradient analysis prompt template: "
+            f"{config._cfg.optimizer.search_algo.gradient_analysis_prompt[:150]}..."
+        )
 
         response = await self.llm_action.ainvoke([HumanMessage(content=gradient_prompt)])
         return response.content.strip(), example_string_without_feedback
@@ -465,12 +589,21 @@ class MCTSPromptOptimizerFeedback:
         num_prompts: int,
         example_string: str = ""
     ) -> list[str]:
-        """Generate new prompt based on gradient analysis and trajectory"""
+        """Generate new prompts based on gradient analysis and trajectory.
 
-        # Format trajectory for context
-        trajectory_text = ""
-        for i, traj_prompt in enumerate(trajectory_prompts):
-            trajectory_text += f"\n{i+1}. {traj_prompt}\n"
+        Args:
+            current_prompt: Current prompt to improve
+            gradient: Gradient analysis from LLM
+            trajectory_prompts: Historical prompts
+            num_prompts: Number of new prompts to generate
+            example_string: Formatted examples
+
+        Returns:
+            List of newly generated prompts
+        """
+        trajectory_text = "\n".join(
+            f"{i+1}. {p}" for i, p in enumerate(trajectory_prompts)
+        )
 
         optimize_prompt = config._cfg.optimizer.search_algo.prompt_generation_prompt.format(
             current_prompt=current_prompt,
@@ -482,40 +615,70 @@ class MCTSPromptOptimizerFeedback:
             plural_verb="s are" if num_prompts > 1 else " is"
         ).strip()
 
-        # Log which prompt template is being used (first 150 chars to verify config)
-        logger.debug(f"[MCTS Runtime] Using prompt generation template: {config._cfg.optimizer.search_algo.prompt_generation_prompt[:150]}...")
+        logger.debug(
+            f"[MCTS Runtime] Prompt generation template: "
+            f"{config._cfg.optimizer.search_algo.prompt_generation_prompt[:150]}..."
+        )
 
         response = await self.llm_critic.ainvoke([HumanMessage(content=optimize_prompt)])
-        improved_prompts_text = response.content.strip()
+        improved_prompts = self._parse_generated_prompts(
+            response.content.strip(),
+            num_prompts,
+            current_prompt
+        )
 
-        # Extract all prompts between <START> and <END> tags
-        import re
-        matches = re.findall(r'<START>\s*(.+?)\s*<END>', improved_prompts_text, re.DOTALL)
+        return improved_prompts
+
+    def _parse_generated_prompts(
+        self,
+        response_text: str,
+        num_prompts: int,
+        fallback_prompt: str
+    ) -> list[str]:
+        """Parse generated prompts from LLM response.
+
+        Extracts prompts between <START> and <END> tags.
+
+        Args:
+            response_text: LLM response text
+            num_prompts: Expected number of prompts
+            fallback_prompt: Fallback if parsing fails
+
+        Returns:
+            List of parsed prompts
+        """
+        matches = re.findall(PROMPT_EXTRACT_PATTERN, response_text, re.DOTALL)
 
         if matches:
             improved_prompts = [match.strip() for match in matches[:num_prompts]]
         else:
-            # Fallback: if no tags found, return current prompt
-            improved_prompts = [current_prompt]
+            improved_prompts = [fallback_prompt]
 
-        # Ensure we return exactly num_prompts (pad with current if needed)
         while len(improved_prompts) < num_prompts:
-            improved_prompts.append(current_prompt)
+            improved_prompts.append(fallback_prompt)
 
         return improved_prompts[:num_prompts]
 
+    # ============================================================================
+    # BEST NODE SELECTION
+    # ============================================================================
+
     def _best_child_of(self, node: MCTSNode) -> MCTSNode:
-        """Return best child by Q value"""
+        """Return best child by Q value."""
         if not node.children:
             return node
         return max(node.children, key=lambda c: c.Q)
 
     def get_best_prompt(self) -> tuple[MCTSNode, str]:
-        """Get the best prompt found"""
+        """Get the best prompt found across entire tree.
+
+        Returns:
+            Tuple of (best node, best prompt)
+        """
         best_node = self.root
         best_q = self.root.Q
 
-        def search_tree(node: MCTSNode):
+        def search_tree(node: MCTSNode) -> None:
             nonlocal best_node, best_q
             if node.N > 0 and node.Q > best_q:
                 best_q = node.Q
@@ -524,7 +687,6 @@ class MCTSPromptOptimizerFeedback:
                 search_tree(child)
 
         search_tree(self.root)
-
         return best_node, best_node.prompt
 
     def get_best_path_with_rewards(self) -> tuple[list[MCTSNode], list[float]]:
@@ -694,10 +856,14 @@ class MCTSPromptOptimizerFeedback:
         best_reward_path = paths_nodes[rewards_rank[0]] if rewards_rank else [self.root]
 
         # Get top-k nodes by reward
-        top_k_reward_nodes = sorted(self.all_nodes, key=lambda node: node.reward, reverse=True)[:min(5, len(self.all_nodes))]
+        top_k_reward_nodes = sorted(
+            self.all_nodes,
+            key=lambda node: node.reward,
+            reverse=True
+        )[:min(TOP_K_NODES, len(self.all_nodes))]
 
         # Select best node from best_reward_path (highest reward)
-        selected_node = sorted(best_reward_path, key=lambda node: node.reward, reverse=True)[0]
+        selected_node = max(best_reward_path, key=lambda node: node.reward)
 
         self.logger.info("\n" + "="*80)
         self.logger.info("PATH ANALYSIS SUMMARY")
@@ -717,9 +883,12 @@ class MCTSPromptOptimizerFeedback:
         self.logger.info(f"  Q-value: {selected_node.Q:.4f}")
         self.logger.info(f"  Visits: {selected_node.N}")
         self.logger.info(f"  Depth: {selected_node.depth}")
-        self.logger.info(f"\nTop-5 nodes by reward:")
+        self.logger.info(f"\nTop-{TOP_K_NODES} nodes by reward:")
         for i, node in enumerate(top_k_reward_nodes, 1):
-            self.logger.info(f"  {i}. Reward: {node.reward:.4f}, Q: {node.Q:.4f}, Visits: {node.N}, Depth: {node.depth}")
+            self.logger.info(
+                f"  {i}. Reward: {node.reward:.4f}, Q: {node.Q:.4f}, "
+                f"Visits: {node.N}, Depth: {node.depth}"
+            )
 
         return {
             'all_paths': paths_nodes,
